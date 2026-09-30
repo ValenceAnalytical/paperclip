@@ -177,6 +177,10 @@ import { chatWebhookBodyParser } from "./middleware/chat-webhook-body.js";
 import { createChatWebhookDiagnostics } from "./services/chat-webhook-diagnostics.js";
 
 type UiMode = "none" | "static" | "vite-dev";
+
+export function resolvePluginHostVersion(hostVersion?: string | null): string {
+  return hostVersion ?? serverVersion;
+}
 const FEEDBACK_EXPORT_FLUSH_INTERVAL_MS = 5_000;
 const CHAT_PUBLICATION_FLUSH_INTERVAL_MS = 1_000;
 const VITE_DEV_ASSET_PREFIXES = [
@@ -876,7 +880,7 @@ export async function createApp(
       lifecycleManager: lifecycle,
       instanceInfo: {
         instanceId: opts.instanceId ?? "default",
-        hostVersion: opts.hostVersion ?? "0.0.0",
+        hostVersion: resolvePluginHostVersion(opts.hostVersion),
         deploymentMode: opts.deploymentMode,
         deploymentExposure: opts.deploymentExposure,
       },
