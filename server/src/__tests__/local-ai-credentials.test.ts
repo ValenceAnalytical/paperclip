@@ -10,7 +10,7 @@ describe("explicit local subscription import", () => {
   it("verifies Claude only from the selected isolated home, never the host account", async () => {
     // A file login returns the whole document, so the refresh token survives.
     // Quota verification still uses the extracted access token.
-    const document = JSON.stringify({ claudeAiOauth: { accessToken: "isolated-claude", refreshToken: "isolated-refresh" } });
+    const document = JSON.stringify({ claudeAiOauth: { accessToken: "isolated-claude", refreshToken: "isolated-refresh", expiresAt: 1790000000000 } });
     mocks.credentialFile.mockResolvedValue(document);
     await expect(readVerifiedLocalAiCredential("anthropic", "/isolated/claude")).resolves.toBe(document);
     expect(mocks.credentialFile).toHaveBeenCalledWith("/isolated/claude/.credentials.json");
@@ -33,8 +33,14 @@ describe("explicit local subscription import", () => {
     await expect(readVerifiedLocalAiCredential("anthropic", "/isolated/claude")).resolves.toBe("setup-token");
     expect(mocks.claudeQuota).toHaveBeenCalledWith("setup-token");
   });
+  it("keeps the bare token for a document with no readable expiry", async () => {
+    // The write-back could never prove a refreshed copy newer, so the file
+    // would freeze at sign-in. The env var keeps today's behaviour.
+    mocks.credentialFile.mockResolvedValue(JSON.stringify({ claudeAiOauth: { accessToken: "no-expiry", refreshToken: "no-expiry-refresh" } }));
+    await expect(readVerifiedLocalAiCredential("anthropic", "/isolated/claude")).resolves.toBe("no-expiry");
+  });
   it("tries the alternate Claude filename after malformed JSON", async () => {
-    const document = JSON.stringify({ claudeAiOauth: { accessToken: "alternate-token", refreshToken: "alternate-refresh" } });
+    const document = JSON.stringify({ claudeAiOauth: { accessToken: "alternate-token", refreshToken: "alternate-refresh", expiresAt: 1790000000000 } });
     mocks.credentialFile.mockResolvedValueOnce("malformed").mockResolvedValueOnce(document);
     await expect(readVerifiedLocalAiCredential("anthropic", "/isolated/claude")).resolves.toBe(document);
     expect(mocks.credentialFile).toHaveBeenLastCalledWith("/isolated/claude/credentials.json");
