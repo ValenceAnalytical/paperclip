@@ -6740,6 +6740,24 @@ registry.registerPath({
 
 registry.registerPath({
   method: "post",
+  path: "/api/heartbeat-runs/{runId}/hermes-approvals/{requestId}/resolve",
+  tags: ["runs"],
+  summary: "Resolve one pending Hermes Gateway approval request",
+  request: {
+    params: z.object({ runId: z.string(), requestId: z.string() }),
+    body: jsonBody(z.object({ choice: z.enum(["once", "deny"]) })),
+  },
+  responses: {
+    202: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    404: r.notFound,
+    409: r.conflict,
+  },
+});
+
+registry.registerPath({
+  method: "post",
   path: "/api/heartbeat-runs/{runId}/runtime-requests/{requestId}/resolve",
   tags: ["runs"],
   summary: "Resolve a pending Paperclip runner runtime request",

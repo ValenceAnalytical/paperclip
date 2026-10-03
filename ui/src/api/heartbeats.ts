@@ -214,6 +214,15 @@ export const heartbeatsApi = {
         resolution: input.resolution,
       },
     ),
+  resolveHermesApproval: (input: {
+    runId: string;
+    requestId: string;
+    choice: "once" | "deny";
+  }) =>
+    api.post<{ accepted: true; duplicate: boolean }>(
+      `/heartbeat-runs/${input.runId}/hermes-approvals/${encodeURIComponent(input.requestId)}/resolve`,
+      { choice: input.choice },
+    ),
   recordWatchdogDecision: (input: WatchdogDecisionInput) =>
     api.post(`/heartbeat-runs/${input.runId}/watchdog-decisions`, {
       decision: input.decision,

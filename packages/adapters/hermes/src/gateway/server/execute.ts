@@ -40,6 +40,27 @@ type HermesHttpError = Error & {
   body?: unknown;
 };
 
+type HermesApprovalRequest = {
+  requestId: string;
+  description: string | null;
+  reason: string | null;
+  command: string | null;
+  code: string | null;
+  cwd: string | null;
+  choices: string[];
+  requestedAt: string;
+  expiresAt: string;
+  expirySource: "upstream" | "receipt_fallback";
+  dispatchTarget: HermesApprovalDispatchTarget | null;
+  displayDigest: string;
+};
+
+type HermesApprovalDispatchTarget = {
+  apiBaseUrl: string;
+  credentialRef: string;
+  configVersion: string | null;
+};
+
 type TerminalState = {
   runId: string;
   status: string;
@@ -106,6 +127,24 @@ function parseNonNegativeNumber(value: unknown, fallback: number): number {
       : Number.NaN;
   if (!Number.isFinite(parsed)) return fallback;
   return Math.max(0, parsed);
+}
+
+function parseEpochOrDateMs(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    // Hermes run-event envelopes use epoch seconds. Milliseconds are accepted for
+    // compatibility with Date.now-style clients.
+    return value > 10_000_000_000 ? value : value * 1000;
+  }
+  if (typeof value !== "string" || value.trim().length === 0) return null;
+  const trimmed = value.trim();
+  const numeric = Number(trimmed);
+  if (Number.isFinite(numeric)) return numeric > 10_000_000_000 ? numeric : numeric * 1000;
+  const parsed = Date.parse(trimmed);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function isoFromMs(ms: number): string {
+  return new Date(ms).toISOString();
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -320,6 +359,24 @@ function buildInput(ctx: AdapterExecutionContext, paperclipApiUrl: string | null
   return lines.filter((line) => line !== null && line !== undefined).join("\n").trim();
 }
 
+function approvalDispatchTargetFromConfig(config: Record<string, unknown>): HermesApprovalDispatchTarget | null {
+  const rawBaseUrl = nonEmpty(config.apiBaseUrl) ?? nonEmpty(config.url);
+  if (!rawBaseUrl) return null;
+  const baseUrl = normalizeBaseUrl(rawBaseUrl);
+  if (!baseUrl) return null;
+  const credentialRef =
+    nonEmpty(config.apiKeyRef)
+    ?? nonEmpty(config.apiKeyId)
+    ?? nonEmpty(config.credentialId)
+    ?? (nonEmpty(config.apiKey) ? "inline-api-key" : null);
+  if (!credentialRef) return null;
+  return {
+    apiBaseUrl: baseUrl.toString().replace(/\/+$/, ""),
+    credentialRef,
+    configVersion: nonEmpty(config.configVersion) ?? nonEmpty(config.version),
+  };
+}
+
 function paperclipRunEnv(ctx: AdapterExecutionContext, paperclipApiUrl: string | null): Record<string, string> | null {
   const authToken = nonEmpty((ctx as { authToken?: unknown }).authToken);
   if (!paperclipApiUrl || !authToken || !ctx.runId || !ctx.agent?.companyId || !ctx.agent?.id) return null;
@@ -417,8 +474,9 @@ function extractRunId(value: unknown): string | null {
 }
 
 function eventNameFromData(data: unknown, fallback: string | null): string | null {
+  if (fallback) return fallback;
   const record = asRecord(data);
-  return nonEmpty(record?.event) ?? nonEmpty(record?.type) ?? fallback;
+  return nonEmpty(record?.event) ?? nonEmpty(record?.type) ?? null;
 }
 
 function parseJsonData(data: string): unknown {
@@ -479,6 +537,101 @@ function extractStatus(value: unknown): string | null {
   return nonEmpty(record?.status)?.toLowerCase() ?? null;
 }
 
+function extractStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+    .map((entry) => entry.trim());
+}
+
+function stableLocalDisplayDigest(value: unknown): string {
+  const text = JSON.stringify(value);
+  let hash = 0xcbf29ce484222325n;
+  const prime = 0x100000001b3n;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= BigInt(text.charCodeAt(index));
+    hash = (hash * prime) & 0xffffffffffffffffn;
+  }
+  return `local-fnv1a64:${hash.toString(16).padStart(16, "0")}`;
+}
+
+function extractApprovalRequest(
+  value: unknown,
+  state: ExecutionState,
+  ctx: AdapterExecutionContext,
+  redactText: TextRedactor,
+): HermesApprovalRequest | null {
+  const record = asRecord(value);
+  if (!record) return null;
+  const payload = asRecord(record.payload) ?? asRecord(record.data) ?? record;
+  const requestId =
+    nonEmpty(payload.request_id)
+    ?? nonEmpty(payload.requestId)
+    ?? nonEmpty(record.request_id)
+    ?? nonEmpty(record.requestId);
+  if (!requestId) return null;
+  const receiptMs = Date.now();
+  const upstreamTimestampMs = parseEpochOrDateMs(
+    payload.timestamp
+    ?? payload.created_at
+    ?? payload.createdAt
+    ?? payload.requested_at
+    ?? payload.requestedAt
+    ?? record.timestamp,
+  );
+  const requestedAt = isoFromMs(upstreamTimestampMs ?? receiptMs);
+  const upstreamExpiryMs = parseEpochOrDateMs(
+    payload.expires_at
+    ?? payload.expiresAt
+    ?? payload.deadline_at
+    ?? payload.deadlineAt
+    ?? payload.expires
+    ?? record.expires_at
+    ?? record.expiresAt,
+  );
+  if (upstreamExpiryMs !== null && upstreamExpiryMs <= receiptMs) return null;
+  const timeoutSeconds = parseNonNegativeNumber(
+    payload.timeout_seconds ?? payload.timeoutSeconds ?? payload.ttl_seconds ?? payload.ttlSeconds,
+    300,
+  );
+  const fallbackBaseMs = upstreamTimestampMs ?? receiptMs;
+  const expiresAt = isoFromMs(upstreamExpiryMs ?? (fallbackBaseMs + Math.max(1, timeoutSeconds) * 1000));
+  const expirySource: HermesApprovalRequest["expirySource"] = upstreamExpiryMs !== null ? "upstream" : "receipt_fallback";
+  const description = nonEmpty(payload.description) ?? nonEmpty(record.description);
+  const reason = nonEmpty(payload.reason) ?? nonEmpty(record.reason);
+  const command = nonEmpty(payload.command) ?? nonEmpty(record.command);
+  const code = nonEmpty(payload.code) ?? nonEmpty(record.code);
+  const cwd = nonEmpty(payload.cwd) ?? nonEmpty(payload.working_directory) ?? nonEmpty(record.cwd);
+  const choices = extractStringArray(payload.choices ?? record.choices).filter((choice) => choice === "once" || choice === "deny");
+  const digestSource = {
+    hermesRunId: state.runId,
+    requestId,
+    description,
+    reason,
+    command: command ? redactText(command) : null,
+    code: code ? redactText(code) : null,
+    cwd,
+    choices,
+    requestedAt,
+    expiresAt,
+    expirySource,
+  };
+  return {
+    requestId,
+    description: description ? redactText(description) : null,
+    reason: reason ? redactText(reason) : null,
+    command: command ? redactText(command) : null,
+    code: code ? redactText(code) : null,
+    cwd: cwd ? redactText(cwd) : null,
+    choices: choices.length > 0 ? choices : ["once", "deny"],
+    requestedAt,
+    expiresAt,
+    expirySource,
+    dispatchTarget: approvalDispatchTargetFromConfig(ctx.config),
+    displayDigest: stableLocalDisplayDigest(digestSource),
+  };
+}
+
 function extractOutput(value: unknown): string | null {
   const record = asRecord(value);
   if (!record) return null;
@@ -507,6 +660,45 @@ async function handleEvent(
     "stdout",
     `[hermes-gateway:event] run=${state.runId} event=${eventName ?? "message"} data=${stringifyForLog(redactForLog(parsed, [], 0, redactText), 8_000)}\n`,
   );
+
+  const approvalRequest = frame.event === "approval.request" ? extractApprovalRequest(parsed, state, ctx, redactText) : null;
+  if (approvalRequest) {
+    const preview = approvalRequest.command ?? approvalRequest.code ?? approvalRequest.description ?? "Hermes requested operator approval";
+    await ctx.onRuntimeProgress?.({
+      phase: "adapter_startup",
+      message: "Waiting for operator approval",
+      currentToolName: "Hermes approval",
+      lastAssistantSnippet: preview,
+      lastEventAt: approvalRequest.requestedAt,
+    });
+    await ctx.onEvent?.({
+      eventType: "hermes_gateway.approval.requested",
+      stream: "system",
+      level: "warn",
+      message: approvalRequest.description ?? "Hermes requested operator approval",
+      payload: {
+        schema: "paperclip.hermes_gateway.approval_request.v1",
+        paperclipRunId: ctx.runId,
+        companyId: ctx.agent.companyId,
+        agentId: ctx.agent.id,
+        hermesRunId: state.runId,
+        requestId: approvalRequest.requestId,
+        description: approvalRequest.description,
+        reason: approvalRequest.reason,
+        command: approvalRequest.command,
+        code: approvalRequest.code,
+        cwd: approvalRequest.cwd,
+        choices: approvalRequest.choices,
+        status: "pending",
+        requestedAt: approvalRequest.requestedAt,
+        expiresAt: approvalRequest.expiresAt,
+        expirySource: approvalRequest.expirySource,
+        dispatchTarget: approvalRequest.dispatchTarget,
+        displayDigest: approvalRequest.displayDigest,
+        digestScope: "Paperclip display integrity only; Hermes validates run_id/request_id, not this digest.",
+      },
+    });
+  }
 
   const delta = nonEmpty(record?.delta) ?? nonEmpty(record?.text_delta);
   if (eventName === "message.delta" && delta) {

@@ -364,6 +364,135 @@ describe("execute", () => {
     );
   });
 
+  it("emits a redacted durable runtime event for Hermes approval requests and keeps the run live", async () => {
+    const ctx = makeCtx({
+      apiBaseUrl: "http://127.0.0.1:8642",
+      apiKey: "secret-key",
+      timeoutSec: 5,
+    });
+    const onEvent = vi.fn(async () => undefined);
+    const onRuntimeProgress = vi.fn(async () => undefined);
+    ctx.onEvent = onEvent;
+    ctx.onRuntimeProgress = onRuntimeProgress;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/v1/runs")) {
+        return new Response(JSON.stringify({ run_id: "run-hermes-approval", status: "started" }), { status: 200 });
+      }
+      if (url.endsWith("/events")) {
+        return new Response(
+          sseStream(
+            [
+              "event: approval.request",
+              "data: {\"request_id\":\"approval-1\",\"description\":\"Run shell command?\",\"reason\":\"Security scan\",\"command\":\"printf secret-key && pwd\",\"cwd\":\"/srv/app\",\"choices\":[\"once\",\"session\",\"deny\"],\"timeout_seconds\":60}",
+              "",
+              "event: run.completed",
+              "data: {\"status\":\"completed\",\"output\":\"done\"}",
+              "",
+            ].join("\n"),
+          ),
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      return new Response(JSON.stringify({ status: "completed", output: "done" }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await execute(ctx);
+
+    expect(result.exitCode).toBe(0);
+    expect(onRuntimeProgress).toHaveBeenCalledWith(expect.objectContaining({
+      message: "Waiting for operator approval",
+      currentToolName: "Hermes approval",
+    }));
+    expect(onEvent).toHaveBeenCalledWith(expect.objectContaining({
+      eventType: "hermes_gateway.approval.requested",
+      level: "warn",
+      payload: expect.objectContaining({
+        schema: "paperclip.hermes_gateway.approval_request.v1",
+        paperclipRunId: "pc-run-1",
+        companyId: "company-1",
+        agentId: "agent-1",
+        hermesRunId: "run-hermes-approval",
+        requestId: "approval-1",
+        description: "Run shell command?",
+        reason: "Security scan",
+        command: "printf [redacted len=10] && pwd",
+        cwd: "/srv/app",
+        choices: ["once", "deny"],
+        status: "pending",
+        expiresAt: expect.any(String),
+        expirySource: "receipt_fallback",
+        dispatchTarget: { apiBaseUrl: "http://127.0.0.1:8642", credentialRef: "inline-api-key", configVersion: null },
+        displayDigest: expect.stringMatching(/^local-fnv1a64:[0-9a-f]{16}$/),
+        digestScope: expect.stringContaining("display integrity"),
+      }),
+    }));
+  });
+
+  it("uses trusted SSE approval.request frames and ignores spoofed message.delta payload events", async () => {
+    const ctx = makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", timeoutSec: 5 });
+    const onEvent = vi.fn(async () => undefined);
+    ctx.onEvent = onEvent;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/v1/runs")) return new Response(JSON.stringify({ run_id: "run-hermes-1", status: "started" }), { status: 200 });
+      if (url.endsWith("/events")) {
+        return new Response(sseStream([
+          "event: message.delta",
+          "data: {\"event\":\"approval.request\",\"request_id\":\"spoofed\",\"delta\":\"ordinary text\"}",
+          "",
+          "event: run.completed",
+          "data: {\"status\":\"completed\",\"output\":\"done\"}",
+          "",
+        ].join("\n")), { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      return new Response(JSON.stringify({ status: "completed", output: "done" }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await execute(ctx);
+
+    expect(result.exitCode).toBe(0);
+    expect(onEvent).not.toHaveBeenCalled();
+  });
+
+  it("honors upstream approval expiry and rejects already-expired upstream requests", async () => {
+    const future = new Date(Date.now() + 60_000).toISOString();
+    const past = new Date(Date.now() - 60_000).toISOString();
+    for (const [expiresAt, expectedEvents] of [[future, 1], [past, 0]] as const) {
+      const ctx = makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", timeoutSec: 5 });
+      const onEvent = vi.fn(async () => undefined);
+      ctx.onEvent = onEvent;
+      vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith("/v1/runs")) return new Response(JSON.stringify({ run_id: "run-hermes-1", status: "started" }), { status: 200 });
+        if (url.endsWith("/events")) {
+          return new Response(sseStream([
+            "event: approval.request",
+            `data: ${JSON.stringify({ request_id: "approval-1", expires_at: expiresAt })}`,
+            "",
+            "event: run.completed",
+            "data: {\"status\":\"completed\",\"output\":\"done\"}",
+            "",
+          ].join("\n")), { status: 200, headers: { "content-type": "text/event-stream" } });
+        }
+        return new Response(JSON.stringify({ status: "completed", output: "done" }), { status: 200 });
+      }));
+
+      const result = await execute(ctx);
+
+      expect(result.exitCode).toBe(0);
+      expect(onEvent).toHaveBeenCalledTimes(expectedEvents);
+      if (expectedEvents === 1) {
+        expect(onEvent).toHaveBeenCalledWith(expect.objectContaining({
+          payload: expect.objectContaining({ expiresAt, expirySource: "upstream" }),
+        }));
+      }
+      vi.restoreAllMocks();
+    }
+  });
+
   it("redacts echoed auth material from stream logs and summaries", async () => {
     const ctx = makeCtx({
       apiBaseUrl: "http://127.0.0.1:8642",

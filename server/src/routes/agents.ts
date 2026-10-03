@@ -16,8 +16,8 @@ import { readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
-import { activityLog, agents as agentsTable, chatConversations, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
-import { and, desc, eq, inArray, not, sql } from "drizzle-orm";
+import { activityLog, agents as agentsTable, chatConversations, companies, heartbeatRunEvents, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
+import { and, desc, eq, inArray, not, or, sql } from "drizzle-orm";
 import { sha256Digest } from "../services/feedback-redaction.js";
 import {
   agentSkillSyncSchema,
@@ -111,6 +111,7 @@ import {
   projectCodexWorkspaceDiffsFromTrace,
   type WorkspaceDiffReprojectionSkipReason,
 } from "../services/provider-trace-workspace-diff-reprojection.js";
+import { appendHeartbeatRunEvent } from "../services/heartbeat-run-events.js";
 import {
   detectAdapterModel,
   findActiveServerAdapter,
@@ -6710,6 +6711,319 @@ export function agentRoutes(
     }
 
     res.json(run);
+  });
+
+  function parseHermesGatewayBaseUrl(value: unknown): URL | null {
+    const raw = typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+    if (!raw) return null;
+    try {
+      const url = new URL(raw);
+      if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+      const normalizedPath = url.pathname.replace(/\/+$/, "") || "/";
+      if (url.port === "9119" && ["", "/", "/chat"].includes(normalizedPath)) {
+        url.pathname = "/api";
+      } else {
+        url.pathname = url.pathname.replace(/\/+$/, "");
+      }
+      url.search = "";
+      url.hash = "";
+      return url;
+    } catch {
+      return null;
+    }
+  }
+
+  function hermesApprovalDispatchTargetFromConfig(config: Record<string, unknown>): { apiBaseUrl: string; credentialRef: string; configVersion: string | null } | null {
+    const baseUrl = parseHermesGatewayBaseUrl(config.apiBaseUrl ?? config.url);
+    const credentialRef = typeof config.apiKeyRef === "string" && config.apiKeyRef.trim().length > 0
+      ? config.apiKeyRef.trim()
+      : typeof config.apiKeyId === "string" && config.apiKeyId.trim().length > 0
+        ? config.apiKeyId.trim()
+        : typeof config.credentialId === "string" && config.credentialId.trim().length > 0
+          ? config.credentialId.trim()
+          : typeof config.apiKey === "string" && config.apiKey.trim().length > 0
+            ? "inline-api-key"
+            : null;
+    if (!baseUrl || !credentialRef) return null;
+    const configVersion = typeof config.configVersion === "string" && config.configVersion.trim().length > 0
+      ? config.configVersion.trim()
+      : typeof config.version === "string" && config.version.trim().length > 0
+        ? config.version.trim()
+        : null;
+    return { apiBaseUrl: baseUrl.toString().replace(/\/+$/, ""), credentialRef, configVersion };
+  }
+
+  function readHermesApprovalDispatchTarget(value: unknown): { apiBaseUrl: string; credentialRef: string; configVersion: string | null } | null {
+    const record = parseObject(value);
+    const apiBaseUrl = typeof record.apiBaseUrl === "string" && record.apiBaseUrl.trim().length > 0 ? record.apiBaseUrl.trim() : null;
+    const credentialRef = typeof record.credentialRef === "string" && record.credentialRef.trim().length > 0 ? record.credentialRef.trim() : null;
+    const configVersion = typeof record.configVersion === "string" && record.configVersion.trim().length > 0 ? record.configVersion.trim() : null;
+    if (!apiBaseUrl || !credentialRef) return null;
+    return { apiBaseUrl, credentialRef, configVersion };
+  }
+
+  function hermesApprovalDispatchTargetMatches(
+    expected: { apiBaseUrl: string; credentialRef: string; configVersion: string | null },
+    current: { apiBaseUrl: string; credentialRef: string; configVersion: string | null },
+  ): boolean {
+    return expected.apiBaseUrl === current.apiBaseUrl
+      && expected.credentialRef === current.credentialRef
+      && expected.configVersion === current.configVersion;
+  }
+
+  async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit, timeoutMs: number): Promise<globalThis.Response> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error("Hermes approval dispatch timed out")), timeoutMs);
+    try {
+      return await fetch(input, { ...init, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  function readHermesApprovalBinding(payload: unknown): {
+    hermesRunId: string;
+    requestId: string;
+    expiresAt: string | null;
+    expirySource: string | null;
+    displayDigest: string | null;
+    dispatchTarget: { apiBaseUrl: string; credentialRef: string; configVersion: string | null } | null;
+    choices: string[];
+  } | null {
+    const record = parseObject(payload);
+    const hermesRunId = typeof record.hermesRunId === "string" && record.hermesRunId.trim() ? record.hermesRunId.trim() : null;
+    const requestId = typeof record.requestId === "string" && record.requestId.trim() ? record.requestId.trim() : null;
+    if (!hermesRunId || !requestId) return null;
+    const expiresAt = typeof record.expiresAt === "string" && record.expiresAt.trim() ? record.expiresAt.trim() : null;
+    const expirySource = typeof record.expirySource === "string" && record.expirySource.trim() ? record.expirySource.trim() : null;
+    const displayDigest = typeof record.displayDigest === "string" && record.displayDigest.trim() ? record.displayDigest.trim() : null;
+    const dispatchTarget = readHermesApprovalDispatchTarget(record.dispatchTarget);
+    const choices = Array.isArray(record.choices)
+      ? record.choices.filter((entry: unknown): entry is string => typeof entry === "string")
+      : [];
+    return { hermesRunId, requestId, expiresAt, expirySource, displayDigest, dispatchTarget, choices };
+  }
+
+  router.post("/heartbeat-runs/:runId/hermes-approvals/:requestId/resolve", async (req: Request, res: Response) => {
+    assertBoard(req);
+    const runId = req.params.runId as string;
+    const requestId = req.params.requestId as string;
+    const choice = typeof req.body?.choice === "string" ? req.body.choice : "";
+    if (choice !== "once" && choice !== "deny") {
+      throw badRequest("choice must be 'once' or 'deny'");
+    }
+    if (!requestId || requestId.length > 200) {
+      throw badRequest("A Hermes approval request identifier is required.");
+    }
+
+    const run = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
+    if (!run) return;
+    if (run.status !== "running") {
+      throw conflict("This Hermes run is no longer waiting for approvals.");
+    }
+
+    const [agent] = await db
+      .select({ id: agentsTable.id, companyId: agentsTable.companyId, adapterType: agentsTable.adapterType, adapterConfig: agentsTable.adapterConfig })
+      .from(agentsTable)
+      .where(and(eq(agentsTable.id, run.agentId), eq(agentsTable.companyId, run.companyId)))
+      .limit(1);
+    if (!agent || agent.adapterType !== "hermes_gateway") {
+      throw badRequest("Run is not a Hermes gateway run.");
+    }
+
+    const requested = await db
+      .select()
+      .from(heartbeatRunEvents)
+      .where(and(
+        eq(heartbeatRunEvents.companyId, run.companyId),
+        eq(heartbeatRunEvents.runId, run.id),
+        eq(heartbeatRunEvents.eventType, "hermes_gateway.approval.requested"),
+        sql`${heartbeatRunEvents.payload} ->> 'requestId' = ${requestId}`,
+      ))
+      .orderBy(desc(heartbeatRunEvents.seq))
+      .limit(1)
+      .then((rows: Array<typeof heartbeatRunEvents.$inferSelect>) => rows[0] ?? null);
+    if (!requested) {
+      throw conflict("This Hermes approval request is stale or is no longer pending.");
+    }
+    const binding = readHermesApprovalBinding(requested.payload);
+    if (!binding || binding.requestId !== requestId) {
+      throw conflict("This Hermes approval request is missing its immutable upstream binding.");
+    }
+    if (binding.choices.length > 0 && !binding.choices.includes(choice)) {
+      throw conflict("This Hermes approval request does not allow that response.");
+    }
+    if (!binding.expiresAt) {
+      throw conflict("This Hermes approval request has no bounded expiry and is not safe to resolve.");
+    }
+    const expiresAtMs = Date.parse(binding.expiresAt);
+    if (!Number.isFinite(expiresAtMs)) {
+      throw conflict("This Hermes approval request has an invalid expiry timestamp.");
+    }
+    if (Date.now() > expiresAtMs) {
+      throw conflict("This Hermes approval request has expired.");
+    }
+    if (!binding.dispatchTarget) {
+      throw conflict("This Hermes approval request is missing its immutable dispatch target binding.");
+    }
+
+    const terminalOrResolution = await db
+      .select({ eventType: heartbeatRunEvents.eventType, payload: heartbeatRunEvents.payload })
+      .from(heartbeatRunEvents)
+      .where(and(
+        eq(heartbeatRunEvents.companyId, run.companyId),
+        eq(heartbeatRunEvents.runId, run.id),
+        or(
+          sql`${heartbeatRunEvents.eventType} in ('run.cancelled','run.canceled','run.completed','run.failed')`,
+          and(
+            sql`${heartbeatRunEvents.eventType} in ('hermes_gateway.approval.resolved','hermes_gateway.approval.dispatching','hermes_gateway.approval.dispatch_failed')`,
+            sql`${heartbeatRunEvents.payload} ->> 'requestId' = ${requestId}`,
+          ),
+        ),
+      ))
+      .orderBy(desc(heartbeatRunEvents.seq))
+      .limit(1)
+      .then((rows: Array<{ eventType: string; payload: unknown }>) => rows[0] ?? null);
+    if (terminalOrResolution) {
+      const payload = parseObject(terminalOrResolution.payload);
+      if (terminalOrResolution.eventType === "hermes_gateway.approval.resolved" && payload.requestId === requestId) {
+        if (payload.choice === choice) {
+          res.status(202).json({ accepted: true, duplicate: true });
+          return;
+        }
+        throw conflict("A different response was already submitted for this Hermes approval request.");
+      }
+      if (terminalOrResolution.eventType === "hermes_gateway.approval.dispatching") {
+        throw conflict("A response is already being dispatched for this Hermes approval request.");
+      }
+      if (terminalOrResolution.eventType === "hermes_gateway.approval.dispatch_failed") {
+        throw conflict("Delivery of this Hermes approval response is uncertain; it will not be resent.");
+      }
+      if (String(terminalOrResolution.eventType).startsWith("run.")) {
+        throw conflict("This Hermes approval request is stale because the run is terminal.");
+      }
+    }
+
+    const canonicalPayload = { requestId, hermesRunId: binding.hermesRunId, choice, displayDigest: binding.displayDigest };
+    const dispatchReservation = await appendHeartbeatRunEvent(db, {
+      companyId: run.companyId,
+      runId: run.id,
+      agentId: run.agentId,
+      eventType: "hermes_gateway.approval.dispatching",
+      stream: "system",
+      level: "info",
+      message: "Dispatching Hermes approval response",
+      payload: {
+        schema: "paperclip.hermes_gateway.approval_dispatch.v1",
+        requestId,
+        hermesRunId: binding.hermesRunId,
+        choice,
+        displayDigest: binding.displayDigest,
+        dispatchedByUserId: req.actor.userId ?? null,
+        dispatchStartedAt: new Date().toISOString(),
+      },
+      nativeSource: {
+        sourceInstanceId: `hermes-gateway:${run.id}`,
+        sourceEventId: `hermes-approval:${run.id}:${requestId}:dispatch`,
+        sourceSeq: Number(requested.seq) + 500_000,
+        protocolSchemaVersion: 1,
+        canonicalPayload,
+      },
+    });
+    if (dispatchReservation.disposition === "duplicate") {
+      throw conflict("A response is already being dispatched for this Hermes approval request.");
+    }
+
+    const config = parseObject(agent.adapterConfig);
+    const apiKey = typeof config.apiKey === "string" && config.apiKey.trim().length > 0 ? config.apiKey.trim() : null;
+    const currentDispatchTarget = hermesApprovalDispatchTargetFromConfig(config);
+    if (!apiKey || !currentDispatchTarget) {
+      throw conflict("Hermes gateway credentials are not configured for this run.");
+    }
+    if (!hermesApprovalDispatchTargetMatches(binding.dispatchTarget, currentDispatchTarget)) {
+      throw conflict("Hermes gateway configuration changed after this approval request was created; refusing to dispatch with different credentials or endpoint.");
+    }
+    const endpoint = `${binding.dispatchTarget.apiBaseUrl}/v1/runs/${encodeURIComponent(binding.hermesRunId)}/approval`;
+    let response: globalThis.Response;
+    try {
+      response = await fetchWithTimeout(endpoint, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify({ choice, request_id: requestId }),
+      }, 10_000);
+    } catch (error) {
+      await appendHeartbeatRunEvent(db, {
+        companyId: run.companyId,
+        runId: run.id,
+        agentId: run.agentId,
+        eventType: "hermes_gateway.approval.dispatch_failed",
+        stream: "system",
+        level: "error",
+        message: "Hermes approval dispatch failed before reaching Hermes",
+        payload: { schema: "paperclip.hermes_gateway.approval_dispatch_failed.v1", requestId, hermesRunId: binding.hermesRunId, choice, error: error instanceof Error ? error.message : String(error) },
+      });
+      throw conflict("Hermes approval dispatch failed before reaching Hermes.");
+    }
+    const bodyText = await response.text().catch(() => "");
+    if (!response.ok) {
+      await appendHeartbeatRunEvent(db, {
+        companyId: run.companyId,
+        runId: run.id,
+        agentId: run.agentId,
+        eventType: "hermes_gateway.approval.dispatch_failed",
+        stream: "system",
+        level: "error",
+        message: "Hermes approval dispatch failed",
+        payload: { schema: "paperclip.hermes_gateway.approval_dispatch_failed.v1", requestId, hermesRunId: binding.hermesRunId, choice, upstreamStatus: response.status, upstreamBodyPresent: bodyText.trim().length > 0 },
+      });
+      throw conflict(`Hermes approval dispatch failed with HTTP ${response.status}`);
+    }
+
+    const appended = await appendHeartbeatRunEvent(db, {
+      companyId: run.companyId,
+      runId: run.id,
+      agentId: run.agentId,
+      eventType: "hermes_gateway.approval.resolved",
+      stream: "system",
+      level: choice === "deny" ? "warn" : "info",
+      message: choice === "deny" ? "Hermes approval denied by operator" : "Hermes approval approved once by operator",
+      payload: {
+        schema: "paperclip.hermes_gateway.approval_resolution.v1",
+        requestId,
+        hermesRunId: binding.hermesRunId,
+        choice,
+        displayDigest: binding.displayDigest,
+        resolvedByUserId: req.actor.userId ?? null,
+        resolvedAt: new Date().toISOString(),
+        upstreamStatus: response.status,
+        upstreamBodyPresent: bodyText.trim().length > 0,
+      },
+      nativeSource: {
+        sourceInstanceId: `hermes-gateway:${run.id}`,
+        sourceEventId: `hermes-approval:${run.id}:${requestId}:resolved`,
+        sourceSeq: Number(requested.seq) + 1_000_000,
+        protocolSchemaVersion: 1,
+        canonicalPayload,
+      },
+    });
+    if (appended.disposition === "duplicate") {
+      res.status(202).json({ accepted: true, duplicate: true });
+      return;
+    }
+    await logActivity(db, {
+      companyId: run.companyId,
+      actorType: "user",
+      actorId: req.actor.userId ?? "board",
+      action: "heartbeat.hermes_approval_resolved",
+      entityType: "heartbeat_run",
+      entityId: run.id,
+      details: { requestId, choice, hermesRunId: binding.hermesRunId, displayDigest: binding.displayDigest },
+    });
+    res.status(202).json({ accepted: true, duplicate: false });
   });
 
   router.post(
