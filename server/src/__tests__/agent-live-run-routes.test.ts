@@ -1489,64 +1489,107 @@ describe("agent live run routes", () => {
     expect(mockQueueRuntimeRequestResolution).not.toHaveBeenCalled();
   });
 
-  it("dispatches a scoped Hermes approval response with canonical request binding", async () => {
-    mockHeartbeatService.getRun.mockResolvedValue({
-      id: "run-1",
-      companyId: "company-1",
-      agentId: "agent-1",
-      status: "running",
-    });
-    const db = createHermesApprovalDbStub({
-      agent: {
-        id: "agent-1",
+  it.each(["running", "waiting_for_approval", "started"])(
+    "dispatches a scoped Hermes approval response with canonical request binding while run status is %s",
+    async (status) => {
+      mockHeartbeatService.getRun.mockResolvedValue({
+        id: "run-1",
         companyId: "company-1",
-        adapterType: "hermes_gateway",
-        adapterConfig: { apiBaseUrl: "http://127.0.0.1:8642", apiKey: "hermes-secret" },
-      },
-      requested: {
-        seq: 7,
-        payload: {
-          schema: "paperclip.hermes_gateway.approval_request.v1",
-          hermesRunId: "hermes-run-1",
-          requestId: "approval-1",
-          choices: ["once", "deny"],
-          expiresAt: new Date(Date.now() + 60_000).toISOString(),
-          displayDigest: "local-fnv1a64:0000000000000001",
-          dispatchTarget: { apiBaseUrl: "http://127.0.0.1:8642", credentialRef: "inline-api-key", configVersion: null },
+        agentId: "agent-1",
+        status,
+      });
+      const db = createHermesApprovalDbStub({
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          adapterType: "hermes_gateway",
+          adapterConfig: { apiBaseUrl: "http://127.0.0.1:8642", apiKey: "hermes-secret" },
         },
-      },
-    });
-    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ ok: true }), { status: 200 }));
-    vi.stubGlobal("fetch", fetchMock);
+        requested: {
+          seq: 7,
+          payload: {
+            schema: "paperclip.hermes_gateway.approval_request.v1",
+            hermesRunId: "hermes-run-1",
+            requestId: "approval-1",
+            choices: ["once", "deny"],
+            expiresAt: new Date(Date.now() + 60_000).toISOString(),
+            displayDigest: "local-fnv1a64:0000000000000001",
+            dispatchTarget: { apiBaseUrl: "http://127.0.0.1:8642", credentialRef: "inline-api-key", configVersion: null },
+          },
+        },
+      });
+      const fetchMock = vi.fn(async () => new Response(JSON.stringify({ ok: true }), { status: 200 }));
+      vi.stubGlobal("fetch", fetchMock);
 
-    const res = await requestApp(await createApp(db), (baseUrl) => request(baseUrl)
-      .post("/api/heartbeat-runs/run-1/hermes-approvals/approval-1/resolve")
-      .send({ choice: "once" }));
+      const res = await requestApp(await createApp(db), (baseUrl) => request(baseUrl)
+        .post("/api/heartbeat-runs/run-1/hermes-approvals/approval-1/resolve")
+        .send({ choice: "once" }));
 
-    expect(res.status, JSON.stringify(res.body)).toBe(202);
-    expect(fetchMock).toHaveBeenCalledWith(
-      "http://127.0.0.1:8642/v1/runs/hermes-run-1/approval",
-      expect.objectContaining({
-        method: "POST",
-        headers: expect.objectContaining({ Authorization: "Bearer hermes-secret" }),
-        body: JSON.stringify({ choice: "once", request_id: "approval-1" }),
-      }),
-    );
-    expect(mockAppendHeartbeatRunEvent).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({
-        eventType: "hermes_gateway.approval.dispatching",
-        nativeSource: expect.objectContaining({ sourceEventId: "hermes-approval:run-1:approval-1:dispatch" }),
-      }),
-    );
-    expect(mockAppendHeartbeatRunEvent).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({
-        eventType: "hermes_gateway.approval.resolved",
-        payload: expect.objectContaining({ choice: "once", resolvedByUserId: "local-board" }),
-      }),
-    );
-  });
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://127.0.0.1:8642/v1/runs/hermes-run-1/approval",
+        expect.objectContaining({
+          method: "POST",
+          headers: expect.objectContaining({ Authorization: "Bearer hermes-secret" }),
+          body: JSON.stringify({ choice: "once", request_id: "approval-1" }),
+        }),
+      );
+      expect(mockAppendHeartbeatRunEvent).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          eventType: "hermes_gateway.approval.dispatching",
+          nativeSource: expect.objectContaining({ sourceEventId: "hermes-approval:run-1:approval-1:dispatch" }),
+        }),
+      );
+      expect(mockAppendHeartbeatRunEvent).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          eventType: "hermes_gateway.approval.resolved",
+          payload: expect.objectContaining({ choice: "once", resolvedByUserId: "local-board" }),
+        }),
+      );
+    },
+  );
+
+  it.each(["queued", "unknown_future", "succeeded", "interrupted", "failed", "cancelled", "canceled", "timed_out", "completed"])(
+    "rejects Hermes approval dispatch while run status is %s without calling Hermes",
+    async (status) => {
+      mockHeartbeatService.getRun.mockResolvedValue({
+        id: "run-1",
+        companyId: "company-1",
+        agentId: "agent-1",
+        status,
+      });
+      const db = createHermesApprovalDbStub({
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          adapterType: "hermes_gateway",
+          adapterConfig: { apiBaseUrl: "http://127.0.0.1:8642", apiKey: "hermes-secret" },
+        },
+        requested: {
+          seq: 7,
+          payload: {
+            hermesRunId: "hermes-run-1",
+            requestId: "approval-1",
+            choices: ["once", "deny"],
+            expiresAt: new Date(Date.now() + 60_000).toISOString(),
+            dispatchTarget: { apiBaseUrl: "http://127.0.0.1:8642", credentialRef: "inline-api-key", configVersion: null },
+          },
+        },
+      });
+      const fetchMock = vi.fn(async () => new Response(JSON.stringify({ ok: true }), { status: 200 }));
+      vi.stubGlobal("fetch", fetchMock);
+
+      const res = await requestApp(await createApp(db), (baseUrl) => request(baseUrl)
+        .post("/api/heartbeat-runs/run-1/hermes-approvals/approval-1/resolve")
+        .send({ choice: "once" }));
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(mockAppendHeartbeatRunEvent).not.toHaveBeenCalled();
+    },
+  );
 
   it("rejects expired Hermes approval requests without calling Hermes", async () => {
     mockHeartbeatService.getRun.mockResolvedValue({ id: "run-1", companyId: "company-1", agentId: "agent-1", status: "running" });

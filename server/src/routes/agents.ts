@@ -6818,7 +6818,8 @@ export function agentRoutes(
 
     const run = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!run) return;
-    if (run.status !== "running") {
+    const hermesApprovalActiveRunStatuses = new Set(["running", "waiting_for_approval", "started"]);
+    if (!hermesApprovalActiveRunStatuses.has(run.status)) {
       throw conflict("This Hermes run is no longer waiting for approvals.");
     }
 
