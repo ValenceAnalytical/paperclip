@@ -275,10 +275,12 @@ describe("adapter routes", () => {
     expect(hermesGateway.capabilities).toMatchObject({
       supportsInstructionsBundle: false,
       supportsSkills: false,
-      supportsLocalAgentJwt: false,
+      supportsLocalAgentJwt: true,
       requiresMaterializedRuntimeSkills: false,
       supportsAcp: false,
     });
+    expect(JSON.stringify(hermesGateway)).not.toContain("apiKey");
+    expect(JSON.stringify(hermesGateway)).not.toContain("Authorization");
   });
 
   it("GET /api/adapters derives supportsSkills from listSkills/syncSkills presence", async () => {
