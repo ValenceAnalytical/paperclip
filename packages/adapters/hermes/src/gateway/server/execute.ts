@@ -320,9 +320,23 @@ function buildInput(ctx: AdapterExecutionContext, paperclipApiUrl: string | null
   return lines.filter((line) => line !== null && line !== undefined).join("\n").trim();
 }
 
-function buildRunBody(ctx: AdapterExecutionContext, sessionKey: string | null): Record<string, unknown> {
+function paperclipRunEnv(ctx: AdapterExecutionContext, paperclipApiUrl: string | null): Record<string, string> | null {
+  const authToken = nonEmpty((ctx as { authToken?: unknown }).authToken);
+  if (!paperclipApiUrl || !authToken || !ctx.runId || !ctx.agent?.companyId || !ctx.agent?.id) return null;
+  return {
+    PAPERCLIP_API_URL: paperclipApiUrl,
+    PAPERCLIP_API_KEY: authToken,
+    PAPERCLIP_RUN_ID: ctx.runId,
+    PAPERCLIP_COMPANY_ID: ctx.agent.companyId,
+    PAPERCLIP_AGENT_ID: ctx.agent.id,
+    ...(issueIdFromContext(ctx) ? { PAPERCLIP_TASK_ID: issueIdFromContext(ctx)! } : {}),
+  };
+}
+
+export function buildRunBodyForTest(ctx: AdapterExecutionContext, sessionKey: string | null): Record<string, unknown> {
   const paperclipApiUrl = nonEmpty(ctx.config.paperclipApiUrl);
   const payloadTemplate = parseObject(ctx.config.payloadTemplate);
+  const { run_env: _ignoredRunEnv, env: _ignoredEnv, ...safePayloadTemplate } = payloadTemplate;
   const configuredInput = nonEmpty(payloadTemplate.input);
   const input = configuredInput && ctx.context.conversationMode === true
     ? `${configuredInput}\n\n${buildInput(ctx, paperclipApiUrl)}`
@@ -331,12 +345,18 @@ function buildRunBody(ctx: AdapterExecutionContext, sessionKey: string | null): 
     nonEmpty(ctx.config.instructions) ??
     nonEmpty(payloadTemplate.instructions) ??
     "Follow the Paperclip wake instructions exactly. Do not expose secrets in logs, comments, or final output.";
+  const runEnv = paperclipRunEnv(ctx, paperclipApiUrl);
   return {
-    ...payloadTemplate,
+    ...safePayloadTemplate,
     input,
     instructions,
     ...(sessionKey ? { session_id: sessionKey } : {}),
+    ...(runEnv ? { run_env: runEnv } : {}),
   };
+}
+
+function buildRunBody(ctx: AdapterExecutionContext, sessionKey: string | null): Record<string, unknown> {
+  return buildRunBodyForTest(ctx, sessionKey);
 }
 
 async function readResponseJson(response: Response): Promise<unknown> {
@@ -850,8 +870,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     extraHeaders,
     accept: "text/event-stream",
   });
+  const authToken = nonEmpty((ctx as { authToken?: unknown }).authToken);
   const redactText = createTextRedactor([
     apiKey,
+    authToken,
     sessionKey,
     runHeaders.Authorization,
     runHeaders["X-Hermes-Session-Key"],
