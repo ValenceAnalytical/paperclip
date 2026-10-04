@@ -88,6 +88,8 @@ const mockHeartbeatsApi = vi.hoisted(() => ({
   get: vi.fn(),
   liveRunsForIssue: vi.fn(),
   activeRunForIssue: vi.fn(),
+  events: vi.fn(),
+  resolveHermesApproval: vi.fn(),
   cancel: vi.fn(),
 }));
 
@@ -356,6 +358,7 @@ vi.mock("../components/IssueChatThread", () => ({
     }[];
     composerPause?: TaskComposerPause | null;
     footer?: ReactNode;
+    composerAccessory?: ReactNode;
   }) => {
     mockIssueChatThreadRender(props);
     return (
@@ -379,6 +382,7 @@ vi.mock("../components/IssueChatThread", () => ({
           </button>
         ))}
         {props.composerPause ? <TaskChatPausedTakeover {...props.composerPause} /> : null}
+        {props.composerAccessory}
         {props.footer}
       </div>
     );
@@ -409,6 +413,7 @@ vi.mock("../components/TaskChatThread", () => ({
     }[];
     composerPause?: TaskComposerPause | null;
     footer?: ReactNode;
+    composerAccessory?: ReactNode;
   }) => {
     mockIssueChatThreadRender(props);
     return (
@@ -449,6 +454,7 @@ vi.mock("../components/TaskChatThread", () => ({
           </button>
         ))}
         {props.composerPause ? <TaskChatPausedTakeover {...props.composerPause} /> : null}
+        {props.composerAccessory}
         {props.footer}
       </div>
     );
@@ -1358,6 +1364,8 @@ describe("IssueDetail", () => {
     mockActivityApi.runsForIssue.mockResolvedValue([]);
     mockHeartbeatsApi.liveRunsForIssue.mockResolvedValue([]);
     mockHeartbeatsApi.activeRunForIssue.mockResolvedValue(null);
+    mockHeartbeatsApi.events.mockResolvedValue([]);
+    mockHeartbeatsApi.resolveHermesApproval.mockResolvedValue({ accepted: true, duplicate: false });
     mockAgentsApi.list.mockResolvedValue([]);
     mockAccessApi.getCurrentBoardAccess.mockResolvedValue({
       companyIds: ["company-1"],
@@ -1431,6 +1439,79 @@ describe("IssueDetail", () => {
     await flushReact();
     expect(mockNavigate).not.toHaveBeenCalled();
     expect(mockIssuesApi.markRead).toHaveBeenCalledWith(canonical.id);
+  });
+
+  it("renders persisted Hermes approval cards on the agent chat composer and resolves through the run route", async () => {
+    const agent = createAgent({ adapterType: "hermes_gateway" });
+    const issue = createIssue({
+      conversationAgentId: agent.id,
+      conversationUserId: "user-1",
+      conversationState: "waiting",
+      status: "in_progress",
+      assigneeAgentId: agent.id,
+    });
+    mockIssuesApi.get.mockResolvedValue(issue);
+    mockHeartbeatsApi.liveRunsForIssue.mockResolvedValue([
+      {
+        id: "run-chat-approval",
+        status: "running",
+        invocationSource: "comment",
+        triggerDetail: null,
+        startedAt: "2026-10-04T04:00:00.000Z",
+        finishedAt: null,
+        createdAt: "2026-10-04T04:00:00.000Z",
+        agentId: agent.id,
+        agentName: agent.name,
+        adapterType: "hermes_gateway",
+        issueId: issue.id,
+      },
+    ]);
+    mockHeartbeatsApi.events.mockResolvedValue([
+      {
+        id: 1,
+        companyId: issue.companyId,
+        runId: "run-chat-approval",
+        agentId: agent.id,
+        seq: 1,
+        eventType: "hermes_gateway.approval.requested",
+        stream: "system",
+        level: "warn",
+        color: null,
+        message: "Hermes approval requested",
+        createdAt: new Date("2026-10-04T04:00:01.000Z"),
+        payload: {
+          requestId: "req-chat-approval",
+          description: "Approve harmless command?",
+          command: "printf '[REDACTED]'",
+          expiresAt: "2999-01-01T00:00:00.000Z",
+          displayDigest: "local-fnv1a64:1234567890abcdef",
+        },
+      },
+    ]);
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <TaskDetailSurface conversation={{ agent, issue, ensureIssue: async () => issue }} />
+        </QueryClientProvider>,
+      );
+    });
+    await waitForAssertion(() => {
+      expect(container.textContent).toContain("Hermes approval required");
+      expect(container.textContent).toContain("Approve harmless command?");
+    });
+
+    const approve = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent === "Approve once",
+    ) as HTMLButtonElement | undefined;
+    expect(approve).toBeTruthy();
+    await act(async () => approve!.click());
+
+    expect(mockHeartbeatsApi.resolveHermesApproval).toHaveBeenCalledWith({
+      runId: "run-chat-approval",
+      requestId: "req-chat-approval",
+      choice: "once",
+    });
   });
 
   it.each(["message", "attachment"])("creates an unused conversation only for the first %s and updates its canonical cache", async (kind) => {

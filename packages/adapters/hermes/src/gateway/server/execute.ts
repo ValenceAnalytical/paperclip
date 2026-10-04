@@ -476,7 +476,19 @@ function extractRunId(value: unknown): string | null {
 function eventNameFromData(data: unknown, fallback: string | null): string | null {
   if (fallback) return fallback;
   const record = asRecord(data);
-  return nonEmpty(record?.event) ?? nonEmpty(record?.type) ?? null;
+  return nonEmpty(record?.event) ?? null;
+}
+
+function isTrustedApprovalRequestFrame(frame: SseFrame, parsed: unknown): boolean {
+  const record = asRecord(parsed);
+  const payloadEvent = nonEmpty(record?.event);
+  const payloadType = nonEmpty(record?.type);
+  if (payloadType && payloadType !== payloadEvent) return false;
+  if (frame.event === "approval.request") {
+    return !payloadEvent || payloadEvent === "approval.request";
+  }
+  if (frame.event !== null && frame.event !== "message" && frame.event !== "run.event") return false;
+  return payloadEvent === "approval.request";
 }
 
 function parseJsonData(data: string): unknown {
@@ -661,7 +673,7 @@ async function handleEvent(
     `[hermes-gateway:event] run=${state.runId} event=${eventName ?? "message"} data=${stringifyForLog(redactForLog(parsed, [], 0, redactText), 8_000)}\n`,
   );
 
-  const approvalRequest = frame.event === "approval.request" ? extractApprovalRequest(parsed, state, ctx, redactText) : null;
+  const approvalRequest = isTrustedApprovalRequestFrame(frame, parsed) ? extractApprovalRequest(parsed, state, ctx, redactText) : null;
   if (approvalRequest) {
     const preview = approvalRequest.command ?? approvalRequest.code ?? approvalRequest.description ?? "Hermes requested operator approval";
     await ctx.onRuntimeProgress?.({

@@ -49,6 +49,7 @@ import { PageSkeleton } from "../components/PageSkeleton";
 import { AgentActionButtons } from "../components/AgentActionButtons";
 import { InlineBanner } from "../components/InlineBanner";
 import { BuiltInBundlePanel } from "../components/BuiltInBundlePanel";
+import { HermesApprovalCards } from "../components/HermesApprovalCard";
 import { ConfigureBuiltInAgentModal } from "../components/ConfigureBuiltInAgentModal";
 import { TrustPresetSection } from "../components/TrustPresetSection";
 import { FileTree, buildFileTree } from "../components/FileTree";
@@ -4249,38 +4250,6 @@ export function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType
     () => buildTranscript(logLines, adapter, { censorUsernameInLogs }),
     [adapter, censorUsernameInLogs, logLines, parserTick],
   );
-  const hermesApprovalRequests = useMemo<Array<{ event: HeartbeatRunEvent; payload: Record<string, unknown> }>>(() => {
-    const resolved = new Map<string, string>();
-    const terminal = new Set<string>();
-    for (const event of events) {
-      const payload = asRecord(event.payload);
-      const requestId = typeof payload?.requestId === "string" ? payload.requestId : null;
-      if (!requestId) continue;
-      if (event.eventType === "hermes_gateway.approval.resolved") {
-        resolved.set(requestId, payload && typeof payload.choice === "string" ? payload.choice : "resolved");
-      }
-      if (event.eventType === "hermes_gateway.approval.dispatch_failed") {
-        terminal.add(requestId);
-      }
-    }
-    return events.flatMap((event: HeartbeatRunEvent) => {
-      if (event.eventType !== "hermes_gateway.approval.requested") return [];
-      const payload = asRecord(event.payload);
-      if (!payload) return [];
-      const requestId = typeof payload.requestId === "string" ? payload.requestId : null;
-      if (!requestId || resolved.has(requestId) || terminal.has(requestId)) return [];
-      const expiresAt = typeof payload.expiresAt === "string" ? Date.parse(payload.expiresAt) : Number.NaN;
-      if (Number.isFinite(expiresAt) && Date.now() > expiresAt) return [];
-      return [{ event, payload: redactPathValue(payload, censorUsernameInLogs) }];
-    });
-  }, [censorUsernameInLogs, events]);
-  const hermesApprovalMutation = useMutation({
-    mutationFn: (input: { requestId: string; choice: "once" | "deny" }) =>
-      heartbeatsApi.resolveHermesApproval({ runId: run.id, requestId: input.requestId, choice: input.choice }),
-    onSuccess: () => {
-      void heartbeatsApi.events(run.id, 0, 200).then((fresh) => setEvents(fresh));
-    },
-  });
   const toolDecisionLookup = useQuery({
     queryKey: queryKeys.tools.runDecisions(run.companyId, run.id),
     queryFn: () => toolsApi.getRunDecisionLookup(run.companyId, run.id),
@@ -4323,64 +4292,10 @@ export function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType
         <RunInvocationCard payload={adapterInvokePayload} censorUsernameInLogs={censorUsernameInLogs} />
       )}
 
-      {hermesApprovalRequests.length > 0 && (
-        <div className="space-y-2">
-          {hermesApprovalRequests.map(({ event, payload }) => {
-            const requestId = String(payload.requestId);
-            const description = typeof payload.description === "string" && payload.description.trim()
-              ? payload.description.trim()
-              : "Hermes is waiting for operator approval.";
-            const preview = typeof payload.command === "string" && payload.command.trim()
-              ? payload.command.trim()
-              : typeof payload.code === "string" && payload.code.trim()
-                ? payload.code.trim()
-                : null;
-            const reason = typeof payload.reason === "string" && payload.reason.trim() ? payload.reason.trim() : null;
-            const cwd = typeof payload.cwd === "string" && payload.cwd.trim() ? payload.cwd.trim() : null;
-            const displayDigest = typeof payload.displayDigest === "string" ? payload.displayDigest : null;
-            const expiresAt = typeof payload.expiresAt === "string" ? payload.expiresAt : null;
-            const pendingThis = hermesApprovalMutation.isPending && hermesApprovalMutation.variables?.requestId === requestId;
-            return (
-              <div key={event.id} className="rounded-2xl border border-amber-300/70 bg-amber-50/80 p-3 text-sm text-amber-950 dark:border-amber-500/40 dark:bg-amber-950/20 dark:text-amber-100">
-                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-                  <div className="min-w-0 space-y-1">
-                    <div className="text-xs font-semibold uppercase tracking-wide text-amber-700 dark:text-amber-300">Hermes approval required</div>
-                    <div>{description}</div>
-                    {reason && <div className="text-xs text-amber-800/80 dark:text-amber-200/80">Reason: {reason}</div>}
-                    {cwd && <div className="text-xs text-amber-800/80 dark:text-amber-200/80">cwd: {cwd}</div>}
-                    {preview && (
-                      <pre className="mt-2 max-h-32 overflow-auto rounded-lg bg-background/70 p-2 text-xs text-foreground whitespace-pre-wrap">
-                        {preview}
-                      </pre>
-                    )}
-                    <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-amber-800/75 dark:text-amber-200/75">
-                      <span>Request {requestId}</span>
-                      {displayDigest && <span>Digest {displayDigest}</span>}
-                      {expiresAt && <span>Expires {relativeTime(expiresAt)}</span>}
-                    </div>
-                    <div className="text-[11px] text-amber-800/70 dark:text-amber-200/70">
-                      Approve once authorizes only this exact Hermes run/request. The digest is Paperclip display integrity, not a Hermes-enforced command hash.
-                    </div>
-                  </div>
-                  <div className="flex shrink-0 gap-2">
-                    <Button type="button" size="xs" variant="default" disabled={pendingThis} onClick={() => hermesApprovalMutation.mutate({ requestId, choice: "once" })}>
-                      Approve once
-                    </Button>
-                    <Button type="button" size="xs" variant="outline" disabled={pendingThis} onClick={() => hermesApprovalMutation.mutate({ requestId, choice: "deny" })}>
-                      Deny
-                    </Button>
-                  </div>
-                </div>
-                {hermesApprovalMutation.isError && hermesApprovalMutation.variables?.requestId === requestId && (
-                  <div className="mt-2 text-xs text-red-700 dark:text-red-300">
-                    {hermesApprovalMutation.error instanceof Error ? hermesApprovalMutation.error.message : "Failed to resolve approval"}
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      )}
+      <HermesApprovalCards
+        runEvents={[{ runId: run.id, events }]}
+        onResolved={() => heartbeatsApi.events(run.id, 0, 200).then((fresh) => setEvents(fresh))}
+      />
 
       <div className="flex items-center justify-between">
         <span className="text-xs font-medium text-muted-foreground">

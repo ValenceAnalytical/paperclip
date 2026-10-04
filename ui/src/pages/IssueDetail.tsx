@@ -209,6 +209,7 @@ import {
 } from "../components/IssueMonitorBanner";
 import { IssueScheduledRetryCard } from "../components/IssueScheduledRetryCard";
 import { ExternallyConnectedTaskBanner } from "../components/chat/ExternallyConnectedTaskBanner";
+import { LiveHermesApprovalCards } from "../components/HermesApprovalCard";
 import {
   IssueProperties,
   type IssuePropertiesDocumentDeepLink,
@@ -1532,6 +1533,24 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     setLocalSteeringPlacements(new Map());
   }, [issueId]);
   const hasLiveRuns = liveRunCount > 0 || !!resolvedActiveRun;
+  const hermesApprovalRuns = useMemo(() => {
+    const byId = new Map<string, LiveRunForIssue | ActiveRunForIssue>();
+    for (const run of resolvedLiveRuns) byId.set(run.id, run);
+    if (resolvedActiveRun) byId.set(resolvedActiveRun.id, resolvedActiveRun);
+    return [...byId.values()].filter((run) => run.adapterType === "hermes_gateway");
+  }, [resolvedActiveRun, resolvedLiveRuns]);
+  const resolvedComposerAccessory = useMemo(() => {
+    const approvalCards = hermesApprovalRuns.length > 0 ? (
+      <LiveHermesApprovalCards runs={hermesApprovalRuns} />
+    ) : null;
+    if (!composerAccessory && !approvalCards) return null;
+    return (
+      <div className="space-y-2">
+        {approvalCards}
+        {composerAccessory}
+      </div>
+    );
+  }, [composerAccessory, hermesApprovalRuns]);
   const {
     data: linkedRuns,
     isPending: linkedRunsPending,
@@ -2337,7 +2356,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
               if (activeRunQueryEnabled) void refetchActiveRun();
             }}
             composerRef={composerRef}
-            composerAccessory={composerAccessory}
+            composerAccessory={resolvedComposerAccessory}
             threadHeader={
               !classicTaskInterfaceEnabled &&
               (threadHeader || loadOlderButton) ? (

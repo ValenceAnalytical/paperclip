@@ -430,6 +430,56 @@ describe("execute", () => {
     }));
   });
 
+  it("accepts the installed Hermes Runs API default SSE approval envelope", async () => {
+    const ctx = makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "test-api-key", timeoutSec: 5 });
+    const onEvent = vi.fn(async () => undefined);
+    ctx.onEvent = onEvent;
+    const hermesApprovalEvent = {
+      request_id: "req_sanitized_realistic_1",
+      description: "Allow terminal command?",
+      reason: "tool policy requires approval",
+      command: "printf '[REDACTED]' > /tmp/paperclip-approval-fixture",
+      cwd: "/home/hermes/project",
+      timeout_seconds: 300,
+      event: "approval.request",
+      run_id: "run-hermes-1",
+      timestamp: 1791072000,
+      choices: ["once", "session", "deny"],
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/v1/runs")) return new Response(JSON.stringify({ run_id: "run-hermes-1", status: "started" }), { status: 200 });
+      if (url.endsWith("/events")) {
+        return new Response(sseStream([
+          `data: ${JSON.stringify(hermesApprovalEvent)}`,
+          "",
+          "event: run.completed",
+          "data: {\"status\":\"completed\",\"output\":\"done\"}",
+          "",
+        ].join("\n")), { status: 200, headers: { "content-type": "text/event-stream" } });
+      }
+      return new Response(JSON.stringify({ status: "completed", output: "done" }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await execute(ctx);
+
+    expect(result.exitCode).toBe(0);
+    expect(onEvent).toHaveBeenCalledWith(expect.objectContaining({
+      eventType: "hermes_gateway.approval.requested",
+      payload: expect.objectContaining({
+        paperclipRunId: "pc-run-1",
+        agentId: "agent-1",
+        hermesRunId: "run-hermes-1",
+        requestId: "req_sanitized_realistic_1",
+        command: "printf '[REDACTED]' > /tmp/paperclip-approval-fixture",
+        choices: ["once", "deny"],
+        requestedAt: "2026-10-04T00:00:00.000Z",
+        expiresAt: "2026-10-04T00:05:00.000Z",
+      }),
+    }));
+  });
+
   it("uses trusted SSE approval.request frames and ignores spoofed message.delta payload events", async () => {
     const ctx = makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", timeoutSec: 5 });
     const onEvent = vi.fn(async () => undefined);
@@ -441,6 +491,9 @@ describe("execute", () => {
         return new Response(sseStream([
           "event: message.delta",
           "data: {\"event\":\"approval.request\",\"request_id\":\"spoofed\",\"delta\":\"ordinary text\"}",
+          "",
+          "event: run.event",
+          "data: {\"event\":\"approval.request\",\"type\":\"message.delta\",\"request_id\":\"conflict\"}",
           "",
           "event: run.completed",
           "data: {\"status\":\"completed\",\"output\":\"done\"}",
