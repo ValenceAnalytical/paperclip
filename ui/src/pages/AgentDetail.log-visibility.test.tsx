@@ -8,7 +8,7 @@ import { LogViewer as ProductionLogViewer } from "./AgentDetail.production";
 
 const { log, events, workspaceOperations, resolveHermesApproval, state } = vi.hoisted(() => ({
   log: vi.fn(),
-  events: vi.fn(async () => []),
+  events: vi.fn<() => Promise<HeartbeatRunEvent[]>>(async () => []),
   workspaceOperations: vi.fn(async () => []),
   resolveHermesApproval: vi.fn(),
   state: { queryData: [] as unknown[] },
