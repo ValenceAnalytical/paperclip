@@ -274,12 +274,7 @@ export async function prepareManagedAiRuntime(
     const env: Record<string, unknown> = {
       ...stripAiAuthBindings(input.config.env),
       ...Object.fromEntries(AI_AUTH_ENV_KEYS.map((key) => [key, ""])),
-      HOME: home,
-      XDG_CONFIG_HOME: path.join(home, "config"),
-      XDG_DATA_HOME: path.join(home, "data"),
-      CODEX_HOME: providerHome,
-      GROK_HOME: providerHome,
-      CLAUDE_CONFIG_DIR: providerHome,
+      ...managedAiHomeEnvironment(home),
     };
     const capability =
       AI_CONNECTION_CAPABILITIES[input.binding.provider].methods[
@@ -329,6 +324,7 @@ export async function prepareManagedAiRuntime(
       accountName: selection.connection.name,
       accountOwnerUserId: selection.grant.subjectUserId,
       identity,
+      home,
       cleanup: async () => {
         try {
           if (subscriptionFile) {

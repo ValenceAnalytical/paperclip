@@ -8,8 +8,8 @@ import { LogViewer as ProductionLogViewer } from "./AgentDetail.production";
 
 const { log, events, workspaceOperations, resolveHermesApproval, state } = vi.hoisted(() => ({
   log: vi.fn(),
-  events: vi.fn(),
-  workspaceOperations: vi.fn(),
+  events: vi.fn(async () => []),
+  workspaceOperations: vi.fn(async () => []),
   resolveHermesApproval: vi.fn(),
   state: { queryData: [] as unknown[] },
 }));
@@ -40,6 +40,8 @@ vi.mock("../components/transcript/RunTranscriptView", () => ({
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+  vi.useRealTimers();
   state.queryData = [];
   log.mockReset();
   events.mockReset();
@@ -137,4 +139,35 @@ it("shows pending Hermes approvals with redacted preview and resolves approve-on
     await act(async () => root.unmount());
     container.remove();
   }
+});
+
+it.each([LogViewer, ProductionLogViewer])("polls logs when WebSocket construction fails and recovers on retry (%#)", async (Viewer) => {
+  vi.useFakeTimers();
+  vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+  vi.stubGlobal("WebSocket", undefined);
+  log.mockResolvedValue({ content: "", nextOffset: 0 });
+  const run = { id: "run-1", companyId: "company-1", agentId: "agent-1", status: "running", logRef: "log" } as HeartbeatRun;
+  const root = createRoot(document.createElement("div"));
+  const sockets: Array<{ onopen: (() => void) | null; close: () => void }> = [];
+  try {
+    await act(async () => root.render(<Viewer run={run} adapterType="codex_local" />));
+    const initialReads = log.mock.calls.length;
+    await act(async () => vi.advanceTimersByTimeAsync(2000));
+    expect(log.mock.calls.length).toBeGreaterThan(initialReads);
+    expect(events).toHaveBeenCalled();
+    vi.stubGlobal("WebSocket", class {
+      onopen = null;
+      close = vi.fn();
+      constructor() { sockets.push(this); }
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(1000));
+    expect(sockets).toHaveLength(1);
+    await act(async () => sockets[0].onopen?.());
+    const readsWhenConnected = log.mock.calls.length;
+    await act(async () => vi.advanceTimersByTimeAsync(4000));
+    expect(log).toHaveBeenCalledTimes(readsWhenConnected);
+  } finally {
+    await act(async () => root.unmount());
+  }
+  expect(sockets[0].close).toHaveBeenCalled();
 });
