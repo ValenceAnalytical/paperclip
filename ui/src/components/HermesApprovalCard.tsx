@@ -1,5 +1,5 @@
-import { useMemo } from "react";
-import { useMutation, useQueries } from "@tanstack/react-query";
+import { useEffect, useMemo, useState } from "react";
+import { useMutation, useQueries, useQueryClient } from "@tanstack/react-query";
 import type { HeartbeatRunEvent } from "@paperclipai/shared";
 import { heartbeatsApi } from "@/api/heartbeats";
 import { relativeTime } from "@/lib/utils";
@@ -14,6 +14,7 @@ type HermesApprovalRun = {
 
 type RunEventsInput = {
   runId: string;
+  runStatus?: string | null;
   events: readonly HeartbeatRunEvent[];
 };
 
@@ -41,6 +42,7 @@ function nonEmptyString(value: unknown): string | null {
 function requestStatus(input: {
   payload: Record<string, unknown>;
   requestId: string;
+  runStatus?: string | null;
   resolved: ReadonlyMap<string, string>;
   failed: ReadonlySet<string>;
   nowMs: number;
@@ -51,6 +53,9 @@ function requestStatus(input: {
   const expiresAt = nonEmptyString(input.payload.expiresAt);
   const expiresAtMs = expiresAt ? Date.parse(expiresAt) : Number.NaN;
   if (Number.isFinite(expiresAtMs) && input.nowMs > expiresAtMs) {
+    return { status: "expired", choice: null };
+  }
+  if (input.runStatus && !["queued", "running", "waiting_for_approval"].includes(input.runStatus)) {
     return { status: "expired", choice: null };
   }
   return { status: "pending", choice: null };
@@ -64,7 +69,7 @@ export function collectHermesApprovalRequests(
   const failed = new Set<string>();
   const requested: HermesApprovalRequestCard[] = [];
 
-  for (const { runId, events } of runEvents) {
+  for (const { runId, runStatus, events } of runEvents) {
     for (const event of events) {
       const payload = asRecord(event.payload);
       const requestId = nonEmptyString(payload?.requestId);
@@ -81,7 +86,7 @@ export function collectHermesApprovalRequests(
       const payload = asRecord(event.payload);
       const requestId = nonEmptyString(payload?.requestId);
       if (!payload || !requestId) continue;
-      const state = requestStatus({ payload, requestId, resolved, failed, nowMs });
+      const state = requestStatus({ payload, requestId, runStatus, resolved, failed, nowMs });
       requested.push({
         eventId: event.id,
         runId,
@@ -112,9 +117,14 @@ export function HermesApprovalCards({
   className?: string;
   onResolved?: (runId: string) => void | Promise<void>;
 }) {
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
   const approvalRequests = useMemo(
-    () => collectHermesApprovalRequests(runEvents),
-    [runEvents],
+    () => collectHermesApprovalRequests(runEvents, nowMs),
+    [runEvents, nowMs],
   );
   const mutation = useMutation({
     mutationFn: (input: { runId: string; requestId: string; choice: "once" | "deny" }) =>
@@ -194,6 +204,7 @@ export function LiveHermesApprovalCards({
   runs: readonly HermesApprovalRun[];
   className?: string;
 }) {
+  const queryClient = useQueryClient();
   const uniqueRuns = useMemo(() => {
     const seen = new Set<string>();
     return runs.filter((run) => {
@@ -215,7 +226,16 @@ export function LiveHermesApprovalCards({
   });
   const runEvents = uniqueRuns.map((run, index) => ({
     runId: run.id,
+    runStatus: run.status,
     events: queries[index]?.data ?? [],
   }));
-  return <HermesApprovalCards runEvents={runEvents} className={className} />;
+  return (
+    <HermesApprovalCards
+      runEvents={runEvents}
+      className={className}
+      onResolved={async (runId) => {
+        await queryClient.invalidateQueries({ queryKey: ["heartbeat-run", runId, "events"] });
+      }}
+    />
+  );
 }

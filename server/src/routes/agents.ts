@@ -6733,17 +6733,39 @@ export function agentRoutes(
     }
   }
 
-  function hermesApprovalDispatchTargetFromConfig(config: Record<string, unknown>): { apiBaseUrl: string; credentialRef: string; configVersion: string | null } | null {
-    const baseUrl = parseHermesGatewayBaseUrl(config.apiBaseUrl ?? config.url);
-    const credentialRef = typeof config.apiKeyRef === "string" && config.apiKeyRef.trim().length > 0
+  function hermesApprovalApiKeyRefFromConfig(config: Record<string, unknown>): string | null {
+    const apiKeyBinding = parseObject(config.apiKey);
+    return typeof config.apiKeyRef === "string" && config.apiKeyRef.trim().length > 0
       ? config.apiKeyRef.trim()
       : typeof config.apiKeyId === "string" && config.apiKeyId.trim().length > 0
         ? config.apiKeyId.trim()
         : typeof config.credentialId === "string" && config.credentialId.trim().length > 0
           ? config.credentialId.trim()
-          : typeof config.apiKey === "string" && config.apiKey.trim().length > 0
-            ? "inline-api-key"
-            : null;
+          : typeof apiKeyBinding.secretId === "string" && apiKeyBinding.secretId.trim().length > 0
+            ? apiKeyBinding.secretId.trim()
+            : typeof config.apiKey === "string" && config.apiKey.trim().length > 0
+              ? "inline-api-key"
+              : null;
+  }
+
+  async function resolveHermesApprovalApiKey(companyId: string, agentId: string, config: Record<string, unknown>): Promise<string | null> {
+    if (typeof config.apiKey === "string" && config.apiKey.trim().length > 0) {
+      return config.apiKey.trim();
+    }
+    const apiKeyBinding = parseObject(config.apiKey);
+    const secretId = typeof apiKeyBinding.secretId === "string" && apiKeyBinding.secretId.trim().length > 0
+      ? apiKeyBinding.secretId.trim()
+      : null;
+    if (!secretId) return null;
+    return await secretsSvc.resolveSecretValue(companyId, secretId, "latest", {
+      bindingContext: { consumerType: "agent", consumerId: agentId, configPath: "apiKey" },
+      accessContext: { consumerType: "system", consumerId: "hermes-approval-dispatch", configPath: "apiKey" },
+    });
+  }
+
+  function hermesApprovalDispatchTargetFromConfig(config: Record<string, unknown>): { apiBaseUrl: string; credentialRef: string; configVersion: string | null } | null {
+    const baseUrl = parseHermesGatewayBaseUrl(config.apiBaseUrl ?? config.url);
+    const credentialRef = hermesApprovalApiKeyRefFromConfig(config);
     if (!baseUrl || !credentialRef) return null;
     const configVersion = typeof config.configVersion === "string" && config.configVersion.trim().length > 0
       ? config.configVersion.trim()
@@ -6766,8 +6788,11 @@ export function agentRoutes(
     expected: { apiBaseUrl: string; credentialRef: string; configVersion: string | null },
     current: { apiBaseUrl: string; credentialRef: string; configVersion: string | null },
   ): boolean {
+    const sameCredential = expected.credentialRef === current.credentialRef
+      || expected.credentialRef === "inline-api-key"
+      || current.credentialRef === "inline-api-key";
     return expected.apiBaseUrl === current.apiBaseUrl
-      && expected.credentialRef === current.credentialRef
+      && sameCredential
       && expected.configVersion === current.configVersion;
   }
 
@@ -6936,7 +6961,7 @@ export function agentRoutes(
     }
 
     const config = parseObject(agent.adapterConfig);
-    const apiKey = typeof config.apiKey === "string" && config.apiKey.trim().length > 0 ? config.apiKey.trim() : null;
+    const apiKey = await resolveHermesApprovalApiKey(run.companyId, run.agentId, config);
     const currentDispatchTarget = hermesApprovalDispatchTargetFromConfig(config);
     if (!apiKey || !currentDispatchTarget) {
       throw conflict("Hermes gateway credentials are not configured for this run.");

@@ -166,6 +166,46 @@ it("coordinates first reveal while keeping the composer and visible history moun
   expect(container.querySelector('[data-testid="mock-editor"]')).toBe(composer);
 });
 
+it("keeps composer accessories visible while a legacy live run has no transcript yet", async () => {
+  render(
+    <TaskChatThread
+      issueId="chat-approval-issue"
+      issueStatus="in_progress"
+      comments={[]}
+      onAdd={async () => {}}
+      companyId="company-1"
+      liveRuns={[
+        {
+          id: "run-chat-approval",
+          runtimeMode: "legacy",
+          status: "running",
+          invocationSource: "comment",
+          triggerDetail: null,
+          startedAt: "2026-10-05T04:59:01.062Z",
+          finishedAt: null,
+          createdAt: "2026-10-05T04:59:01.062Z",
+          agentId: "agent-hermes",
+          agentName: "Hermes Bridge Browser Agent",
+          adapterType: "hermes_gateway",
+          issueId: "chat-approval-issue",
+        },
+      ]}
+      composerAccessory={
+        <div data-testid="hermes-approval-cards">Hermes approval required</div>
+      }
+    />,
+  );
+
+  await act(async () => {
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+  });
+
+  expect(container.textContent).toContain("Working");
+  expect(container.textContent).toContain("Waiting for transcript");
+  expect(container.textContent).toContain("Hermes approval required");
+  expect(container.querySelector('[data-testid="hermes-approval-cards"]')).not.toBeNull();
+});
+
 it("keeps an acknowledged optimistic bubble mounted with its canonical comment target", () => {
   const comment = {
     companyId: "company",

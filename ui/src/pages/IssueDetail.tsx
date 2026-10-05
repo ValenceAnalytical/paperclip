@@ -1533,24 +1533,6 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     setLocalSteeringPlacements(new Map());
   }, [issueId]);
   const hasLiveRuns = liveRunCount > 0 || !!resolvedActiveRun;
-  const hermesApprovalRuns = useMemo(() => {
-    const byId = new Map<string, LiveRunForIssue | ActiveRunForIssue>();
-    for (const run of resolvedLiveRuns) byId.set(run.id, run);
-    if (resolvedActiveRun) byId.set(resolvedActiveRun.id, resolvedActiveRun);
-    return [...byId.values()].filter((run) => run.adapterType === "hermes_gateway");
-  }, [resolvedActiveRun, resolvedLiveRuns]);
-  const resolvedComposerAccessory = useMemo(() => {
-    const approvalCards = hermesApprovalRuns.length > 0 ? (
-      <LiveHermesApprovalCards runs={hermesApprovalRuns} />
-    ) : null;
-    if (!composerAccessory && !approvalCards) return null;
-    return (
-      <div className="space-y-2">
-        {approvalCards}
-        {composerAccessory}
-      </div>
-    );
-  }, [composerAccessory, hermesApprovalRuns]);
   const {
     data: linkedRuns,
     isPending: linkedRunsPending,
@@ -1566,6 +1548,40 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   });
   const resolvedActivity = activity ?? [];
   const resolvedLinkedRuns = linkedRuns ?? [];
+  const hermesApprovalRuns = useMemo(() => {
+    const byId = new Map<string, LiveRunForIssue | ActiveRunForIssue>();
+    for (const run of resolvedLiveRuns) byId.set(run.id, run);
+    if (resolvedActiveRun) byId.set(resolvedActiveRun.id, resolvedActiveRun);
+    for (const run of resolvedLinkedRuns) {
+      if (run.adapterType !== "hermes_gateway" || byId.has(run.runId)) continue;
+      byId.set(run.runId, {
+        id: run.runId,
+        runtimeMode: run.runtimeMode,
+        status: run.status,
+        invocationSource: "comment",
+        triggerDetail: null,
+        startedAt: run.startedAt,
+        finishedAt: run.finishedAt,
+        createdAt: run.createdAt,
+        agentId: run.agentId,
+        agentName: "Hermes Bridge Agent",
+        adapterType: run.adapterType,
+      } as LiveRunForIssue);
+    }
+    return [...byId.values()].filter((run) => run.adapterType === "hermes_gateway");
+  }, [resolvedActiveRun, resolvedLinkedRuns, resolvedLiveRuns]);
+  const resolvedComposerAccessory = useMemo(() => {
+    const approvalCards = hermesApprovalRuns.length > 0 ? (
+      <LiveHermesApprovalCards runs={hermesApprovalRuns} />
+    ) : null;
+    if (!composerAccessory && !approvalCards) return null;
+    return (
+      <div className="space-y-2">
+        {approvalCards}
+        {composerAccessory}
+      </div>
+    );
+  }, [composerAccessory, hermesApprovalRuns]);
   const retryFailedRun = useMutation({
     mutationFn: async (runId: string) => {
       const failedRun = resolvedLinkedRuns.find((run) => run.runId === runId);
