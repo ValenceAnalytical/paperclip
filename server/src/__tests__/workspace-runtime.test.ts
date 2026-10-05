@@ -7165,7 +7165,14 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
       ]);
 
       const readinessWaitStartedAt = Date.now();
-      await new Promise((resolve) => setTimeout(resolve, 60_250));
+      // Loop on Date.now(): on WSL the monotonic clock can advance past a
+      // single setTimeout deadline without Date.now() moving the same amount
+      // (host suspend/resume, NTP correction), so we keep sleeping until the
+      // wall-clock readiness window the assertion measures has actually passed.
+      while (Date.now() - readinessWaitStartedAt < 60_250) {
+        const remaining = 60_250 - (Date.now() - readinessWaitStartedAt);
+        await new Promise((resolve) => setTimeout(resolve, Math.max(remaining, 25)));
+      }
       expect(Date.now() - readinessWaitStartedAt).toBeGreaterThanOrEqual(60_000);
 
       await fs.writeFile(releaseMarkerPath, "release");

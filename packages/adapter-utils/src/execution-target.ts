@@ -2740,24 +2740,22 @@ function nextProbeFileName() {
 // wrapper reads the probe file's identity, (dev, ino, ctimeMs), off the open
 // file descriptor itself (fstat), not off the path, so a peer that swaps the
 // path in the short gap after create cannot poison the identity this
-// wrapper trusts as its own. Right before removal, this wrapper reads the
-// path's identity again and removes it only when that identity still
-// matches. A same-sandbox peer that deletes the probe file and creates its
-// own entry at the same path in between leaves a different identity behind,
-// so this wrapper leaves that entry untouched instead of removing it. This
-// covers a peer's replacement file, a peer's replacement directory, and a
-// peer's replacement symbolic link alike, because all three change the
-// identity this wrapper reads back. The identity check includes ctimeMs,
-// not only (dev, ino): a filesystem can hand this call's freed inode number
-// straight back out to a peer's very next create at the same path, so
-// (dev, ino) alone can match a path this call no longer owns; ctimeMs resets
-// on every create, so a peer's replacement carries a different one even when
-// the inode number repeats. Node's filesystem API has no call that removes a
-// path only when its identity still matches an earlier read as one atomic
-// step, so a gap remains between this wrapper's final identity read and the
-// removal call itself. A peer that wins this gap can put any entry at the
-// probe path before the removal call runs. This can include a pre-existing
-// file the peer renames into place, not only a file the peer creates fresh.
+// wrapper trusts as its own. Keep that descriptor open until after the final
+// path identity check and optional removal: closing it first can let the
+// filesystem immediately reuse the just-freed inode for a peer replacement,
+// and timestamp granularity can make ctimeMs match too. Right before removal,
+// this wrapper reads the path's identity again and removes it only when that
+// identity still matches the still-open descriptor. A same-sandbox peer that
+// deletes the probe file and creates its own entry at the same path in between
+// leaves a different identity behind, so this wrapper leaves that entry
+// untouched instead of removing it. This covers a peer's replacement file, a
+// peer's replacement directory, and a peer's replacement symbolic link alike.
+// Node's filesystem API has no call that removes a path only when its identity
+// still matches an earlier read as one atomic step, so a gap remains between
+// this wrapper's final identity read and the removal call itself. A peer that
+// wins this gap can put any entry at the probe path before the removal call
+// runs. This can include a pre-existing file the peer renames into place, not
+// only a file the peer creates fresh.
 // The removal call then removes whatever entry sits at the probe path at
 // that moment. Two bounds still hold on that removal. The path always
 // stays under dirPath. If the entry is a symbolic link, the removal call
@@ -2785,14 +2783,14 @@ async function birthtimeSurvivesProbe(dirPath) {
   let ownedIdentity = null;
   try {
     const createdStats = await handle.stat();
-    // ctimeMs guards against inode reuse; see the function comment above.
+    // ctimeMs still guards against same-path replacement while the descriptor
+    // keeps the original inode from being freed and immediately reused.
     ownedIdentity = { dev: createdStats.dev, ino: createdStats.ino, ctimeMs: createdStats.ctimeMs };
   } catch {
     ownedIdentity = null;
-  } finally {
-    await handle.close().catch(() => undefined);
   }
   if (!ownedIdentity) {
+    await handle.close().catch(() => undefined);
     // fstat on this call's own just-opened descriptor failed. This call then
     // has no verified identity for the probe file it created, so it must not
     // check or remove that file by path: a peer could already own the entry
@@ -2802,20 +2800,24 @@ async function birthtimeSurvivesProbe(dirPath) {
     // identity read can never let this probe report success.
     return "its own probe file's identity could not be read from the open file descriptor";
   }
-  // The one gap the fs API cannot close: this lstat and the removal below
-  // are two separate calls, not one atomic "remove if identity still
-  // matches" step. A peer that wins this narrow gap can put any entry at
-  // the probe path, including a pre-existing file it renames into place,
-  // and the removal call below removes whatever entry is there when it
-  // runs.
-  const currentStats = await fs.lstat(probePath).catch(() => null);
-  const stillOwned =
-    currentStats !== null &&
-    currentStats.dev === ownedIdentity.dev &&
-    currentStats.ino === ownedIdentity.ino &&
-    currentStats.ctimeMs === ownedIdentity.ctimeMs;
-  if (stillOwned) {
-    await fs.rm(probePath, { force: true }).catch(() => undefined);
+  try {
+    // The one gap the fs API cannot close: this lstat and the removal below
+    // are two separate calls, not one atomic "remove if identity still
+    // matches" step. A peer that wins this narrow gap can put any entry at
+    // the probe path, including a pre-existing file it renames into place,
+    // and the removal call below removes whatever entry is there when it
+    // runs.
+    const currentStats = await fs.lstat(probePath).catch(() => null);
+    const stillOwned =
+      currentStats !== null &&
+      currentStats.dev === ownedIdentity.dev &&
+      currentStats.ino === ownedIdentity.ino &&
+      currentStats.ctimeMs === ownedIdentity.ctimeMs;
+    if (stillOwned) {
+      await fs.rm(probePath, { force: true }).catch(() => undefined);
+    }
+  } finally {
+    await handle.close().catch(() => undefined);
   }
   let after;
   try {

@@ -47,7 +47,7 @@ describe("image-owned plugin catalogs", () => {
     expect(() => readDistributionPluginCatalog(root, BUNDLED_PLUGIN_CATALOG)).toThrow();
     save(); symlinkSync(os.tmpdir(), path.join(localPath, "outside"));
     expect(() => readDistributionPluginCatalog(root, BUNDLED_PLUGIN_CATALOG)).toThrow(/symlinks/);
-    rmSync(path.join(localPath, "outside")); rmSync(path.join(localPath, "dist", "worker.js"));
+    rmSync(path.join(localPath, "outside"), { recursive: true, force: true }); rmSync(path.join(localPath, "dist", "worker.js"));
     save([{ ...entry, digest: distributionBundleDigest(localPath) }]);
     expect(() => readDistributionPluginCatalog(root, BUNDLED_PLUGIN_CATALOG)).toThrow();
   });
