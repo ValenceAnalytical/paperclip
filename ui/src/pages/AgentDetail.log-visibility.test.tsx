@@ -111,7 +111,7 @@ it("shows pending Hermes approvals with redacted preview and resolves approve-on
       description: "Approve shell command",
       reason: "Needs operator confirmation",
       command: "printf '[REDACTED]'",
-      cwd: "/home/forrest/project",
+      cwd: "/workspace/project",
       expiresAt: "2099-01-01T00:00:00.000Z",
       displayDigest: "local:abc123",
     },
