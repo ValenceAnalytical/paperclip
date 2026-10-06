@@ -110,6 +110,21 @@ export const queryKeys = {
   audit: {
     runs: (companyId: string, agentId?: string | null) =>
       ["audit", companyId, "runs", agentId ?? "__all"] as const,
+    kpi: (
+      companyId: string,
+      filters: { from?: string | null; to?: string | null; agentId?: string | null; projectId?: string | null; provider?: string | null },
+    ) =>
+      [
+        "audit",
+        companyId,
+        "kpi",
+        filters.from ?? "",
+        filters.to ?? "",
+        filters.agentId ?? "__all",
+        filters.projectId ?? "__all",
+        filters.provider ?? "__all",
+      ] as const,
+    kpiOptions: (companyId: string) => ["audit", companyId, "kpi", "options"] as const,
     agentActions: (
       companyId: string,
       filters: {

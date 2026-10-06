@@ -9,6 +9,7 @@ import { useNavigate, useSearchParams } from "@/lib/router";
 import { Costs } from "@/pages/Costs";
 import { Timeline } from "@/pages/Timeline";
 import { AuditFeed, type AuditFeedMode } from "./AuditFeed";
+import { AuditKpi } from "./AuditKpi";
 import { AuditRuns } from "./AuditRuns";
 import { RoutineAuditActivity } from "./RoutineAuditActivity";
 import {
@@ -123,6 +124,8 @@ export function AuditHub({ section }: { section: AuditSection }) {
         <AuditRuns companyId={selectedCompanyId} routineId={routineId} />
       ) : section === "budgets" ? (
         <Costs embedded initialTab="budgets" lockTab />
+      ) : section === "analytics" ? (
+        <AuditKpi companyId={selectedCompanyId} />
       ) : section === "timeline" ? (
         <Timeline embedded />
       ) : (

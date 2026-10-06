@@ -385,16 +385,19 @@ function boardRoutes(streamlinedUiEnabled: boolean) {
         <>
           <Route path="activity/runs" element={<AuditHub section="runs" />} />
           <Route path="activity/costs" element={<AuditHub section="costs" />} />
+          <Route path="activity/analytics" element={<AuditHub section="analytics" />} />
           <Route path="activity/budgets" element={<AuditHub section="budgets" />} />
           <Route path="activity/timeline" element={<AuditHub section="timeline" />} />
           <Route path="audit" element={<AuditCompatibilityRedirect to="/activity" forceAgentMode />} />
           <Route path="audit/activity" element={<AuditCompatibilityRedirect to="/activity" />} />
           <Route path="audit/runs" element={<AuditCompatibilityRedirect to="/activity/runs" />} />
           <Route path="audit/costs" element={<AuditCompatibilityRedirect to="/activity/costs" />} />
+          <Route path="audit/analytics" element={<AuditCompatibilityRedirect to="/activity/analytics" />} />
           <Route path="audit/budgets" element={<AuditCompatibilityRedirect to="/activity/budgets" />} />
           <Route path="audit/timeline" element={<AuditCompatibilityRedirect to="/activity/timeline" />} />
           <Route path="runs" element={<AuditCompatibilityRedirect to="/activity/runs" />} />
           <Route path="costs" element={<AuditCompatibilityRedirect to="/activity/costs" />} />
+          <Route path="analytics" element={<AuditCompatibilityRedirect to="/activity/analytics" />} />
           <Route path="budgets" element={<AuditCompatibilityRedirect to="/activity/budgets" />} />
         </>
       ) : (

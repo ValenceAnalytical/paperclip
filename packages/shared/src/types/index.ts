@@ -877,6 +877,21 @@ export type {
   RoutineListItem,
 } from "./routine.js";
 export type { CostEvent, CostSummary, IssueCostSummary, CostByAgent, CostByProviderModel, CostByBiller, CostByAgentModel, CostWindowSpendRow, CostByProject } from "./cost.js";
+export type {
+  KpiRange,
+  KpiFilters,
+  KpiRunCounts,
+  KpiDuration,
+  KpiCost,
+  KpiCoverage,
+  KpiApprovalWait,
+  KpiOverview,
+  KpiTrendBucket,
+  KpiTrend,
+  KpiAgentRow,
+  KpiByAgent,
+  KpiFilterOptions,
+} from "./kpi.js";
 export type { FinanceEvent, FinanceSummary, FinanceByBiller, FinanceByKind } from "./finance.js";
 export type {
   AgentWakeupResponse,

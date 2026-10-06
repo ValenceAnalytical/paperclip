@@ -1,4 +1,4 @@
-export type AuditSection = "activity" | "runs" | "costs" | "budgets" | "timeline";
+export type AuditSection = "activity" | "runs" | "costs" | "analytics" | "budgets" | "timeline";
 
 export const AUDIT_SECTIONS: ReadonlyArray<{
   value: AuditSection;
@@ -8,6 +8,7 @@ export const AUDIT_SECTIONS: ReadonlyArray<{
   { value: "activity", label: "Activity", href: "/activity" },
   { value: "runs", label: "Runs", href: "/activity/runs" },
   { value: "costs", label: "Costs", href: "/activity/costs" },
+  { value: "analytics", label: "Analytics", href: "/activity/analytics" },
   { value: "budgets", label: "Budgets", href: "/activity/budgets" },
   { value: "timeline", label: "Timeline", href: "/activity/timeline" },
 ];
