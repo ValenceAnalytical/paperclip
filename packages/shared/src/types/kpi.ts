@@ -30,11 +30,11 @@ export interface KpiRunCounts {
 }
 
 export interface KpiDuration {
-  /** p50 of (finished_at - started_at) in milliseconds for succeeded runs; null if none. */
+  /** p50 of (finished_at - started_at) in milliseconds for completed runs; null if none. */
   p50Ms: number | null;
   /** p95 of same; null if none. */
   p95Ms: number | null;
-  /** How many succeeded runs with both timestamps contributed to the percentiles. */
+  /** How many completed runs (succeeded/failed/cancelled) with both timestamps contributed. */
   sampleSize: number;
 }
 
@@ -47,12 +47,22 @@ export interface KpiCost {
 }
 
 export interface KpiCoverage {
-  /** Distinct heartbeat_run_ids on cost_events within window & filters. */
+  /**
+   * Distinct heartbeat_runs.id in the selected run cohort that have ≥ 1 cost
+   * event in the window (join on company_id + heartbeat_run_id). Reflects the
+   * cohort scope, not every cost event seen in the window.
+   */
   runsWithCost: number;
   /** Runs with no corresponding cost event. */
   runsWithoutCost: number;
-  /** 2dp percentage of total runs with ≥ 1 cost event. */
+  /** 2dp percentage of selected runs with ≥ 1 cost event. */
   coveragePercent: number;
+  /**
+   * Sum(cost_cents) over cost events in the event window + filter predicates.
+   * Reported separately from cohort coverage so observers see event-window
+   * spend without conflating it with the run cohort's coverage.
+   */
+  eventWindowSpendCents: number | null;
 }
 
 export interface KpiApprovalWait {
@@ -60,6 +70,17 @@ export interface KpiApprovalWait {
   p50Ms: number | null;
   p95Ms: number | null;
   sampleSize: number;
+  /**
+   * How the metric is scoped. 'agent' means filtered to
+   * approvals.requested_by_agent_id = filters.agentId. 'company' means the
+   * companywide board approval wait with no agent-side filter applied.
+   */
+  scope: "company" | "agent";
+  /**
+   * True when a projectId filter was requested; approvals have no supported
+   * project scope so run-/cost-level project filtering was not applied here.
+   */
+  projectFilterIgnored: boolean;
 }
 
 export interface KpiOverview {

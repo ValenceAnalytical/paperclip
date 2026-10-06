@@ -234,9 +234,16 @@ export function AuditKpi({ companyId }: AuditKpiProps) {
           <MetricTile label="Runs" value={String(overview.runCounts.total)} subtitle={`${overview.runCounts.succeeded} S / ${overview.runCounts.failed} F / ${overview.runCounts.cancelled} C · retries ${overview.runCounts.retries}`} icon={PlayCircle} />
           <MetricTile label="Succeeded" value={String(overview.runCounts.succeeded)} subtitle={`${percent(overview.runCounts.succeeded, overview.runCounts.total)} of total runs`} icon={CheckCircle2} />
           <MetricTile label="Duration p50" value={formatMs(overview.duration.p50Ms)} subtitle={`p95 ${formatMs(overview.duration.p95Ms)} · n=${overview.duration.sampleSize}`} icon={Clock3} />
-          <MetricTile label="Spend" value={overview.cost.totalCents == null ? "—" : formatCents(overview.cost.totalCents)} subtitle={`${overview.coverage.coveragePercent}% reported-cost coverage`} icon={DollarSign} />
-          <MetricTile label="Tasks done" value={String(overview.tasksDone)} subtitle="Task completion; not inferred from run success" icon={ListChecks} />
-          <MetricTile label="Approval wait" value={overview.approvalWait.tracked ? formatMs(overview.approvalWait.p50Ms) : "not tracked"} subtitle={overview.approvalWait.tracked ? `p95 ${formatMs(overview.approvalWait.p95Ms)} · n=${overview.approvalWait.sampleSize}` : "No durable decisions in window"} icon={Clock3} />
+          <MetricTile label="Spend" value={overview.cost.totalCents == null ? "—" : formatCents(overview.cost.totalCents)} subtitle={`${overview.coverage.coveragePercent}% selected-run cost coverage`} icon={DollarSign} />
+          <MetricTile label="Tasks done" value={String(overview.tasksDone)} subtitle="Task completed_at; not updated_at or run success" icon={ListChecks} />
+          <MetricTile
+            label="Approval wait"
+            value={overview.approvalWait.tracked ? formatMs(overview.approvalWait.p50Ms) : "not tracked"}
+            subtitle={overview.approvalWait.tracked
+              ? `Board ${overview.approvalWait.scope} wait · p95 ${formatMs(overview.approvalWait.p95Ms)} · n=${overview.approvalWait.sampleSize}${overview.approvalWait.projectFilterIgnored ? " · project filter ignored" : ""}`
+              : `No durable board decisions in window${overview.approvalWait.projectFilterIgnored ? " · project filter ignored" : ""}`}
+            icon={Clock3}
+          />
         </div>
       ) : null}
 

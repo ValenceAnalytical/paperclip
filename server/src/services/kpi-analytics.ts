@@ -1,4 +1,4 @@
-import { and, eq, gte, isNotNull, lt, sql } from "drizzle-orm";
+import { and, eq, gte, isNotNull, lt, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, approvals, costEvents, heartbeatRuns, issues } from "@paperclipai/db";
 import type {
@@ -85,6 +85,9 @@ function nullableInt(value: unknown): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+/** SQL completed-status gate: succeeded, failed, cancelled are all "completed". */
+const COMPLETED_STATUS_SQL = sql`${heartbeatRuns.status} in ('succeeded','failed','cancelled')`;
+
 async function queryRunCounts(
   db: Db,
   companyId: string,
@@ -104,7 +107,7 @@ async function queryRunCounts(
         percentile_cont(0.5) within group (
           order by extract(epoch from (${heartbeatRuns.finishedAt} - ${heartbeatRuns.startedAt})) * 1000
         ) filter (
-          where ${heartbeatRuns.status} = 'succeeded'
+          where ${COMPLETED_STATUS_SQL}
             and ${heartbeatRuns.startedAt} is not null
             and ${heartbeatRuns.finishedAt} is not null
         )
@@ -113,14 +116,14 @@ async function queryRunCounts(
         percentile_cont(0.95) within group (
           order by extract(epoch from (${heartbeatRuns.finishedAt} - ${heartbeatRuns.startedAt})) * 1000
         ) filter (
-          where ${heartbeatRuns.status} = 'succeeded'
+          where ${COMPLETED_STATUS_SQL}
             and ${heartbeatRuns.startedAt} is not null
             and ${heartbeatRuns.finishedAt} is not null
         )
       `,
       durationSample: sql<number>`
         count(*) filter (
-          where ${heartbeatRuns.status} = 'succeeded'
+          where ${COMPLETED_STATUS_SQL}
             and ${heartbeatRuns.startedAt} is not null
             and ${heartbeatRuns.finishedAt} is not null
         )::int
@@ -149,28 +152,65 @@ async function queryCost(
   from: Date,
   to: Date,
   filters: KpiFilters,
-): Promise<KpiCost & { runsWithCost: number }> {
+): Promise<KpiCost> {
   const row = await db
     .select({
       total: sql<string | null>`sum(${costEvents.costCents})`,
       inputTokens: sql<string | null>`sum(${costEvents.inputTokens})`,
       cachedInputTokens: sql<string | null>`sum(${costEvents.cachedInputTokens})`,
       outputTokens: sql<string | null>`sum(${costEvents.outputTokens})`,
-      rowCount: sql<number>`count(*)::int`,
-      runsWithCost: sql<number>`count(distinct ${costEvents.heartbeatRunId}) filter (where ${costEvents.heartbeatRunId} is not null)::int`,
     })
     .from(costEvents)
     .where(costWhere(companyId, from, to, filters))
     .then((rows) => rows[0]);
 
-  const hasRows = Number(row?.rowCount ?? 0) > 0;
+  // SQL semantics: sum(x) returns NULL when zero rows match or when all values
+  // are NULL. Preserve that — don't coerce "unknown" into 0.
   return {
-    totalCents: hasRows ? Number(row?.total ?? 0) : null,
-    inputTokens: hasRows ? Number(row?.inputTokens ?? 0) : null,
-    cachedInputTokens: hasRows ? Number(row?.cachedInputTokens ?? 0) : null,
-    outputTokens: hasRows ? Number(row?.outputTokens ?? 0) : null,
-    runsWithCost: Number(row?.runsWithCost ?? 0),
+    totalCents: nullableInt(row?.total),
+    inputTokens: nullableInt(row?.inputTokens),
+    cachedInputTokens: nullableInt(row?.cachedInputTokens),
+    outputTokens: nullableInt(row?.outputTokens),
   };
+}
+
+/**
+ * Coverage: of the selected run cohort, how many have ≥ 1 cost event in the
+ * event window and under the same company + applicable filters. Preserves the
+ * event-window spend separately so observers can see raw event spend without
+ * conflating it with cohort coverage.
+ */
+async function queryCoverage(
+  db: Db,
+  companyId: string,
+  from: Date,
+  to: Date,
+  filters: KpiFilters,
+): Promise<{ runsWithCost: number }> {
+  // Cost filters that are supported by cost_events; drop run-only filters.
+  const costExists: SQL[] = [
+    eq(costEvents.companyId, companyId),
+    sql`${costEvents.heartbeatRunId} = ${heartbeatRuns.id}`,
+    gte(costEvents.occurredAt, from),
+    lt(costEvents.occurredAt, to),
+  ];
+  if (filters.agentId) costExists.push(eq(costEvents.agentId, filters.agentId));
+  if (filters.projectId) costExists.push(eq(costEvents.projectId, filters.projectId));
+  if (filters.provider) costExists.push(eq(costEvents.provider, filters.provider));
+
+  const existsSubquery = sql`exists (
+    select 1 from ${costEvents} where ${and(...costExists)}
+  )`;
+
+  const row = await db
+    .select({
+      runsWithCost: sql<number>`count(distinct ${heartbeatRuns.id})::int`,
+    })
+    .from(heartbeatRuns)
+    .where(and(runWhere(companyId, from, to, filters), existsSubquery))
+    .then((rows) => rows[0]);
+
+  return { runsWithCost: Number(row?.runsWithCost ?? 0) };
 }
 
 async function queryTasksDone(
@@ -180,11 +220,16 @@ async function queryTasksDone(
   to: Date,
   filters: KpiFilters,
 ): Promise<number> {
+  // Anchor on completed_at (not updated_at): an issue can be updated for
+  // unrelated reasons after it transitioned to done, and an issue can be in
+  // 'done' status without a durable completed timestamp. We only count a
+  // task as done inside the window if completed_at falls inside the window.
   const conditions = [
     eq(issues.companyId, companyId),
     eq(issues.status, "done"),
-    gte(issues.updatedAt, from),
-    lt(issues.updatedAt, to),
+    isNotNull(issues.completedAt),
+    gte(issues.completedAt, from),
+    lt(issues.completedAt, to),
   ];
   if (filters.projectId) conditions.push(eq(issues.projectId, filters.projectId));
   if (filters.agentId) conditions.push(eq(issues.assigneeAgentId, filters.agentId));
@@ -202,7 +247,26 @@ async function queryApprovalWait(
   companyId: string,
   from: Date,
   to: Date,
+  filters: KpiFilters,
 ): Promise<KpiApprovalWait> {
+  // Approval scope semantics:
+  // - `agentId` is supported via approvals.requested_by_agent_id.
+  // - `projectId` is not supported — approvals have no project column — so a
+  //   project filter does not restrict this metric. We disclose that via
+  //   `projectFilterIgnored` instead of silently narrowing or claiming
+  //   Hermes-style per-call latency.
+  const scope: "company" | "agent" = filters.agentId ? "agent" : "company";
+  const projectFilterIgnored = filters.projectId != null;
+  const conditions: SQL[] = [
+    eq(approvals.companyId, companyId),
+    isNotNull(approvals.decidedAt),
+    gte(approvals.decidedAt, from),
+    lt(approvals.decidedAt, to),
+  ];
+  if (filters.agentId) {
+    conditions.push(eq(approvals.requestedByAgentId, filters.agentId));
+  }
+
   const row = await db
     .select({
       sample: sql<number>`count(*)::int`,
@@ -210,25 +274,27 @@ async function queryApprovalWait(
       p95: sql<string | null>`percentile_cont(0.95) within group (order by extract(epoch from (${approvals.decidedAt} - ${approvals.createdAt})) * 1000)`,
     })
     .from(approvals)
-    .where(
-      and(
-        eq(approvals.companyId, companyId),
-        isNotNull(approvals.decidedAt),
-        gte(approvals.decidedAt, from),
-        lt(approvals.decidedAt, to),
-      ),
-    )
+    .where(and(...conditions))
     .then((rows) => rows[0]);
 
   const sample = Number(row?.sample ?? 0);
   if (sample === 0) {
-    return { tracked: false, p50Ms: null, p95Ms: null, sampleSize: 0 };
+    return {
+      tracked: false,
+      p50Ms: null,
+      p95Ms: null,
+      sampleSize: 0,
+      scope,
+      projectFilterIgnored,
+    };
   }
   return {
     tracked: true,
     p50Ms: nullableInt(row?.p50),
     p95Ms: nullableInt(row?.p95),
     sampleSize: sample,
+    scope,
+    projectFilterIgnored,
   };
 }
 
@@ -238,14 +304,18 @@ export function kpiAnalyticsService(db: Db) {
       const filters = normalizeFilters(input.filters);
       const { from, to } = parseRange(input.range);
 
-      const [runs, cost, tasksDone, approvalWait] = await Promise.all([
+      const [runs, cost, coverageRaw, tasksDone, approvalWait] = await Promise.all([
         queryRunCounts(db, input.companyId, from, to, filters),
         queryCost(db, input.companyId, from, to, filters),
+        queryCoverage(db, input.companyId, from, to, filters),
         queryTasksDone(db, input.companyId, from, to, filters),
-        queryApprovalWait(db, input.companyId, from, to),
+        queryApprovalWait(db, input.companyId, from, to, filters),
       ]);
 
-      const runsWithCost = Math.min(cost.runsWithCost, runs.total);
+      // Coverage is derived from the selected run cohort joined to cost events
+      // in the event window — not Math.min(cost.runsWithCost, runs.total),
+      // which disguised event-window spend outside the cohort as coverage.
+      const runsWithCost = coverageRaw.runsWithCost;
       const runsWithoutCost = Math.max(0, runs.total - runsWithCost);
       const coverage: KpiCoverage = {
         runsWithCost,
@@ -254,6 +324,7 @@ export function kpiAnalyticsService(db: Db) {
           runs.total === 0
             ? 0
             : Number(((runsWithCost / runs.total) * 100).toFixed(2)),
+        eventWindowSpendCents: cost.totalCents,
       };
 
       const duration: KpiDuration = {
@@ -312,7 +383,6 @@ export function kpiAnalyticsService(db: Db) {
         .select({
           bucket: sql<string>`to_char(date_trunc('day', ${costEvents.occurredAt} at time zone 'UTC'), 'YYYY-MM-DD"T"HH24:MI:SS"Z"')`,
           totalCents: sql<string | null>`sum(${costEvents.costCents})`,
-          rowCount: sql<number>`count(*)::int`,
         })
         .from(costEvents)
         .where(costWhere(input.companyId, from, to, filters))
@@ -321,8 +391,9 @@ export function kpiAnalyticsService(db: Db) {
 
       const costByBucket = new Map<string, number | null>();
       for (const row of costRows) {
-        const hasRows = Number(row.rowCount ?? 0) > 0;
-        costByBucket.set(row.bucket, hasRows ? Number(row.totalCents ?? 0) : null);
+        // sum(cost_cents) returns null only when the bucket has no cost rows
+        // (grouped buckets never have zero members); keep SQL semantics.
+        costByBucket.set(row.bucket, nullableInt(row.totalCents));
       }
 
       const runByBucket = new Map<string, { total: number; succeeded: number; failed: number }>();
@@ -370,7 +441,7 @@ export function kpiAnalyticsService(db: Db) {
             percentile_cont(0.5) within group (
               order by extract(epoch from (${heartbeatRuns.finishedAt} - ${heartbeatRuns.startedAt})) * 1000
             ) filter (
-              where ${heartbeatRuns.status} = 'succeeded'
+              where ${COMPLETED_STATUS_SQL}
                 and ${heartbeatRuns.startedAt} is not null
                 and ${heartbeatRuns.finishedAt} is not null
             )
@@ -379,14 +450,14 @@ export function kpiAnalyticsService(db: Db) {
             percentile_cont(0.95) within group (
               order by extract(epoch from (${heartbeatRuns.finishedAt} - ${heartbeatRuns.startedAt})) * 1000
             ) filter (
-              where ${heartbeatRuns.status} = 'succeeded'
+              where ${COMPLETED_STATUS_SQL}
                 and ${heartbeatRuns.startedAt} is not null
                 and ${heartbeatRuns.finishedAt} is not null
             )
           `,
           durationSample: sql<number>`
             count(*) filter (
-              where ${heartbeatRuns.status} = 'succeeded'
+              where ${COMPLETED_STATUS_SQL}
                 and ${heartbeatRuns.startedAt} is not null
                 and ${heartbeatRuns.finishedAt} is not null
             )::int
@@ -405,7 +476,6 @@ export function kpiAnalyticsService(db: Db) {
           inputTokens: sql<string | null>`sum(${costEvents.inputTokens})`,
           cachedInputTokens: sql<string | null>`sum(${costEvents.cachedInputTokens})`,
           outputTokens: sql<string | null>`sum(${costEvents.outputTokens})`,
-          rowCount: sql<number>`count(*)::int`,
         })
         .from(costEvents)
         .leftJoin(agents, eq(agents.id, costEvents.agentId))
@@ -442,12 +512,13 @@ export function kpiAnalyticsService(db: Db) {
 
       for (const row of costRows) {
         const existing = byAgent.get(row.agentId);
-        const hasRows = Number(row.rowCount ?? 0) > 0;
+        // Group-by rows always have ≥ 1 member row; preserve SQL sum() null
+        // semantics so a token column that is all-null stays null, not 0.
         const cost: KpiCost = {
-          totalCents: hasRows ? Number(row.totalCents ?? 0) : null,
-          inputTokens: hasRows ? Number(row.inputTokens ?? 0) : null,
-          cachedInputTokens: hasRows ? Number(row.cachedInputTokens ?? 0) : null,
-          outputTokens: hasRows ? Number(row.outputTokens ?? 0) : null,
+          totalCents: nullableInt(row.totalCents),
+          inputTokens: nullableInt(row.inputTokens),
+          cachedInputTokens: nullableInt(row.cachedInputTokens),
+          outputTokens: nullableInt(row.outputTokens),
         };
         if (existing) {
           existing.cost = cost;
