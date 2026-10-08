@@ -7,8 +7,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createHermesGatewayServerAdapter } from "@paperclipai/hermes-paperclip-adapter";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { beforeAll, afterAll, describe, it, expect, vi } from "vitest";
 import {
   approvals, issueApprovals, issueThreadInteractions,
@@ -95,7 +94,10 @@ const support = await getEmbeddedPostgresTestSupport();
         }
         if (req.method === "GET" && req.url === "/v1/runs/hermes-run-fresh/events") {
           res.writeHead(200, { "content-type": "text/event-stream" });
-          res.end(`event: run.completed\ndata: ${JSON.stringify({ status: "completed", output: "resumed after queued comment" })}\n\n`);
+          res.end([
+            `event: approval.request\ndata: ${JSON.stringify({ request_id: "approval-fresh", description: "fresh run approval", choices: ["once", "deny"], timeout_seconds: 300 })}\n\n`,
+            `event: run.completed\ndata: ${JSON.stringify({ status: "completed", output: "resumed after queued comment" })}\n\n`,
+          ].join(""));
           return;
         }
         if (req.method === "GET" && req.url === "/v1/runs/hermes-run-fresh") {
@@ -410,9 +412,6 @@ const support = await getEmbeddedPostgresTestSupport();
       .where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
     await db.update(issueComments).set({ authorUserId: "operator", createdAt: new Date("2026-09-11T09:00:00Z") })
       .where(eq(issueComments.id, f.commentId));
-    // Hold the Paperclip agent slot so admission proves the queued run without
-    // launching an uncontrolled adapter process from the heartbeat scheduler.
-    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
     const queueId = randomUUID();
     await db.insert(agentWakeupRequests).values({ id: queueId, companyId: f.companyId, agentId: f.agentId,
       source: "automation", reason: "issue_commented", status: "deferred_issue_execution",
@@ -421,8 +420,20 @@ const support = await getEmbeddedPostgresTestSupport();
         queuedCommentInterrupt: { actorId: "board", requestedAt: new Date().toISOString() } },
     });
 
-    await withFakeHermesGateway(async ({ baseUrl, requests }) => {
-      await db.update(agents).set({ adapterConfig: { apiBaseUrl: baseUrl, apiKey: "test-" + "hermes-key" } }).where(eq(agents.id, f.agentId));
+    const previousAgentJwtSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = "explicit-continuation-test-secret";
+    try {
+      await withFakeHermesGateway(async ({ baseUrl, requests }) => {
+        await db.update(agents).set({ adapterConfig: {
+        apiBaseUrl: baseUrl,
+        apiKey: "test-hermes-key",
+        apiKeyRef: "secret-ref-hermes",
+        paperclipApiUrl: "https://paperclip.example/api",
+        sessionKeyStrategy: "issue",
+        timeoutSec: 5,
+        pollIntervalMs: 250,
+        eventReconnectMs: 250,
+      } }).where(eq(agents.id, f.agentId));
       const heartbeat = heartbeatService(db);
       await heartbeat.resumeQueuedCommentInterrupt(f.companyId, queueId, { retryCleanup: true });
       let [blockedWake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, queueId));
@@ -452,63 +463,59 @@ const support = await getEmbeddedPostgresTestSupport();
         queueId,
         association: "historical_approval_event",
       });
+
       await Promise.all([
         heartbeat.resumeQueuedCommentInterrupt(f.companyId, queueId, { retryCleanup: true }),
         heartbeat.resumeQueuedCommentInterrupt(f.companyId, queueId, { retryCleanup: true }),
       ]);
+      await heartbeat.resumeQueuedRuns();
+      await heartbeat.drainActiveRunExecutions();
 
       const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, queueId));
       expect(receipt.status).toBe("coalesced");
       expect(receipt.payload?.queuedCommentInterrupt).toMatchObject({ actorId: "board" });
-      const runs = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.status, "queued")));
+      const runs = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.agentId, f.agentId),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${f.issueId}`, sql`${heartbeatRuns.contextSnapshot}->'wakeCommentIds' = ${JSON.stringify([f.commentId])}::jsonb`));
       expect(runs).toHaveLength(1);
-      expect(runs[0]).toMatchObject({ agentId: f.agentId, runtimeMode: "legacy",
-        contextSnapshot: { wakeCommentIds: [f.commentId] } });
+      expect(runs[0]).toMatchObject({ agentId: f.agentId, runtimeMode: "legacy", status: "succeeded",
+        contextSnapshot: { wakeCommentIds: [f.commentId] }, resultJson: { run_id: "hermes-run-fresh", status: "completed" } });
+      const runId = runs[0].id;
       const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
       expect(action.evidence.explicitUserContinuation).toMatchObject({
         queuedCommentInterruptId: queueId,
         previousRunId: f.sourceRunId,
-        runId: runs[0].id,
+        runId,
       });
       expect(action.evidence.automaticRecovery).toMatchObject({ replay: "explicit_user_continuation" });
       expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
 
-      const envelope = await buildExecutionContinuation({ db, companyId: f.companyId, issueId: f.issueId,
-        agentId: f.agentId, runId: runs[0].id, context: runs[0].contextSnapshot!, summary: null, exposeLowTrustRaw: false });
-      expect(envelope.interruptedRunId).toBe(f.sourceRunId);
-      expect(envelope.originCommentIds).toEqual([f.commentId]);
-
-      const adapter = createHermesGatewayServerAdapter();
-      const result = await adapter.execute({
-        runId: runs[0].id,
-        agent: { id: f.agentId, companyId: f.companyId, name: "Hermes", adapterType: "hermes_gateway",
-          adapterConfig: { apiBaseUrl: baseUrl, apiKey: "test-hermes-key", apiKeyRef: "secret-ref-hermes", paperclipApiUrl: "https://paperclip.example/api", sessionKeyStrategy: "issue", timeoutSec: 5 } },
-        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: "ACC-111" },
-        config: { apiBaseUrl: baseUrl, apiKey: "test-hermes-key", apiKeyRef: "secret-ref-hermes", paperclipApiUrl: "https://paperclip.example/api", sessionKeyStrategy: "issue", timeoutSec: 5 },
-        context: {
-          issueId: f.issueId,
-          wakeReason: "issue_commented",
-          paperclipWake: { reason: "issue_commented", issue: { id: f.issueId, identifier: "ACC-111", title: "Resume" }, comments: envelope.messages },
-        },
-        authToken: "paperclip-run-token",
-        onLog: vi.fn(async () => undefined),
-        onMeta: vi.fn(async () => undefined),
+      const freshApprovals = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, runId),
+        eq(heartbeatRunEvents.eventType, "hermes_gateway.approval.requested")));
+      expect(freshApprovals).toHaveLength(1);
+      expect(freshApprovals[0].payload).toMatchObject({
+        paperclipRunId: runId, hermesRunId: "hermes-run-fresh", requestId: "approval-fresh", status: "pending",
       });
-      expect(result).toMatchObject({ exitCode: 0, summary: "resumed after queued comment" });
+
       const oldStateReads = requests.filter(request => request.method === "GET" && request.url === "/v1/runs/old-hermes-run");
       expect(oldStateReads.length).toBeGreaterThanOrEqual(1);
       expect(oldStateReads.every(request => request.headers.authorization === "Bearer test-hermes-key")).toBe(true);
       const createCalls = requests.filter(request => request.method === "POST" && request.url === "/v1/runs");
       expect(createCalls).toHaveLength(1);
       expect(createCalls[0].headers.authorization).toBe("Bearer test-hermes-key");
-      expect(createCalls[0].headers["idempotency-key"]).toBe(runs[0].id);
+      expect(createCalls[0].headers["idempotency-key"]).toBe(runId);
       expect(createCalls[0].headers["x-hermes-session-key"]).toBe(`paperclip:company:${f.companyId}:agent:${f.agentId}:issue:${f.issueId}`);
       expect(createCalls[0].body).toMatchObject({
         session_id: `paperclip:company:${f.companyId}:agent:${f.agentId}:issue:${f.issueId}`,
-        run_env: { PAPERCLIP_RUN_ID: runs[0].id, PAPERCLIP_COMPANY_ID: f.companyId, PAPERCLIP_AGENT_ID: f.agentId, PAPERCLIP_TASK_ID: f.issueId },
+        run_env: { PAPERCLIP_RUN_ID: runId, PAPERCLIP_COMPANY_ID: f.companyId, PAPERCLIP_AGENT_ID: f.agentId, PAPERCLIP_TASK_ID: f.issueId },
       });
       expect(JSON.stringify(createCalls[0].body)).not.toContain("test-hermes-key");
-    }, { oldRunId: "old-hermes-run", oldStatus: "completed" });
+      expect(requests.some(request => request.method === "POST" && request.url.includes("approval"))).toBe(false);
+      console.log("ACTUAL_SCHEDULER_HERMES", JSON.stringify({ runId, status: runs[0].status, httpPostRuns: createCalls.length, savedCommentId: f.commentId, approvalEvents: freshApprovals.length }));
+      }, { oldRunId: "old-hermes-run", oldStatus: "completed" });
+    } finally {
+      if (previousAgentJwtSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+      else process.env.PAPERCLIP_AGENT_JWT_SECRET = previousAgentJwtSecret;
+    }
   });
 
   it("blocks a Paperclip-cancelled Hermes gateway queue while the authenticated old Hermes run is still running", async () => {
