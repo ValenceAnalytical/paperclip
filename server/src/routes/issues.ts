@@ -339,6 +339,7 @@ import {
   NativeSessionSteeringError,
   steerNativeSession,
 } from "../services/native-runtime/native-session-executor.js";
+import { recordHermesGatewayHistoricalTerminalProof } from "../services/explicit-native-continuation.js";
 import {
   buildQueuedCommentQueueSnapshot,
   decideQueuedCommentQueueSteering,
@@ -360,6 +361,10 @@ const queuedCommentSteeringTargetSchema =
   });
 const queuedCommentInterruptTargetSchema = queuedCommentMutationTargetSchema.extend({
   targetRunId: z.string().min(1).nullable(),
+});
+const hermesGatewayTerminalProofSchema = queuedCommentMutationTargetSchema.extend({
+  targetRunId: z.string().guid(),
+  hermesRunId: z.string().trim().min(1).max(200),
 });
 const editQueuedCommentSchema = queuedCommentMutationTargetSchema.extend({
   body: z
@@ -15395,6 +15400,36 @@ export function issueRoutes(
       );
       publishActivity(activityPublication as ActivityPublication);
       res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, queue));
+    },
+  );
+
+  router.post(
+    "/issues/:id/queued-comments/hermes-gateway-terminal-proof",
+    validate(hermesGatewayTerminalProofSchema),
+    async (req, res) => {
+      assertBoard(req);
+      if (!req.actor.userId) throw forbidden("Board user context required");
+      const issue = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+      if (!issue) return;
+      const decision = await decideIssueAccess(req, issue, "issue:comment");
+      if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+      if (!issue.assigneeAgentId) throw conflict("Issue has no assigned agent");
+      try {
+        const result = await recordHermesGatewayHistoricalTerminalProof({
+          db, companyId: issue.companyId, issueId: issue.id, agentId: issue.assigneeAgentId,
+          actorUserId: req.actor.userId, queueId: req.body.queueId, queueRevision: req.body.revision,
+          paperclipRunId: req.body.targetRunId, hermesRunId: req.body.hermesRunId,
+        });
+        await logActivity(db, {
+          companyId: issue.companyId, actorType: "user", actorId: req.actor.userId,
+          action: "issue.hermes_gateway_terminal_proof_requested", entityType: "issue", entityId: issue.id,
+          details: { queueId: req.body.queueId, targetRunId: req.body.targetRunId, hermesRunId: req.body.hermesRunId, recoveryActionId: result.recoveryActionId },
+        });
+        res.json({ ok: true, recoveryActionId: result.recoveryActionId, receipt: result.receipt });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "hermes_gateway_terminal_proof_failed";
+        throw conflict("Hermes gateway terminal proof was not accepted", { code: message });
+      }
     },
   );
 

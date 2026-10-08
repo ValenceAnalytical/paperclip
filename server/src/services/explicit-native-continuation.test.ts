@@ -16,11 +16,12 @@ import {
   issues, nativeRunFinalizations, nativeRunResults, completionContracts, environmentLeases, environments, issueRelations, issueTreeHolds, issueTreeHoldMembers,
 } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase, getEmbeddedPostgresTestSupport } from "../__tests__/helpers/embedded-postgres.js";
-import { admitExplicitNativeContinuation } from "./explicit-native-continuation.js";
+import { admitExplicitNativeContinuation, recordHermesGatewayHistoricalTerminalProof } from "./explicit-native-continuation.js";
 import { buildExecutionContinuation } from "./execution-continuation.js";
 import { heartbeatService, persistHeartbeatRunProcessMetadata, type HeartbeatEnvironmentRuntime } from "./heartbeat.js";
 import { getExecutionBlocker } from "./execution-blocker.js";
 import { createDurableChatWakeupRequest } from "./durable-chat-wakeup.js";
+import { queuedCommentQueueRevision } from "./issue-queued-comment-queue.js";
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("explicit native conversation continuation", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -49,6 +50,19 @@ const support = await getEmbeddedPostgresTestSupport();
       actorType: "user", actorId: "board", reason: "issue_commented" };
   }
   type Fixture = Awaited<ReturnType<typeof seed>>;
+
+  async function queueRevision(queueId: string, commentId: string) {
+    const [comment] = await db.select({ id: issueComments.id, updatedAt: issueComments.updatedAt }).from(issueComments).where(eq(issueComments.id, commentId));
+    return queuedCommentQueueRevision({ queueId, comments: [comment!] });
+  }
+
+  async function recordHistoricalHermesApprovalEvent(f: Fixture, hermesRunId: string) {
+    await appendHeartbeatRunEvent(db, { companyId: f.companyId, runId: f.sourceRunId, agentId: f.agentId,
+      eventType: "hermes_gateway.approval.requested", stream: "system", level: "warn", payload: {
+        schema: "paperclip.hermes_gateway.approval_request.v1", paperclipRunId: f.sourceRunId,
+        companyId: f.companyId, agentId: f.agentId, hermesRunId, requestId: randomUUID(), status: "pending",
+      } });
+  }
 
   async function withFakeHermesGateway<T>(handler: (input: { baseUrl: string; requests: Array<{ method: string; url: string; headers: Record<string, string>; body: unknown }> }) => Promise<T>, opts: { oldRunId?: string; oldStatus?: string } = {}): Promise<T> {
     const requests: Array<{ method: string; url: string; headers: Record<string, string>; body: unknown }> = [];
@@ -408,9 +422,36 @@ const support = await getEmbeddedPostgresTestSupport();
     });
 
     await withFakeHermesGateway(async ({ baseUrl, requests }) => {
-      await db.update(agents).set({ adapterConfig: { apiBaseUrl: baseUrl, apiKey: "test-hermes-key" } }).where(eq(agents.id, f.agentId));
-      await db.update(heartbeatRuns).set({ runnerProfileJson: { adapterDispatch: { adapterType: "hermes_gateway", hermesGateway: { apiBaseUrl: baseUrl, credentialRef: "inline-api-key", configVersion: null, hermesRunId: "old-hermes-run" } } } }).where(eq(heartbeatRuns.id, f.sourceRunId));
+      await db.update(agents).set({ adapterConfig: { apiBaseUrl: baseUrl, apiKey: "test-" + "hermes-key" } }).where(eq(agents.id, f.agentId));
       const heartbeat = heartbeatService(db);
+      await heartbeat.resumeQueuedCommentInterrupt(f.companyId, queueId, { retryCleanup: true });
+      let [blockedWake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, queueId));
+      expect(blockedWake.status).toBe("deferred_issue_execution");
+      expect(blockedWake.payload?.executionWait).toMatchObject({ reason: "remote_hermes_terminal_state_unknown" });
+      await expect(recordHermesGatewayHistoricalTerminalProof({
+        db, companyId: f.companyId, issueId: f.issueId, agentId: f.agentId,
+        actorUserId: "board", queueId, queueRevision: await queueRevision(queueId, f.commentId),
+        paperclipRunId: f.sourceRunId, hermesRunId: "old-hermes-run",
+      })).rejects.toThrow("hermes_gateway_run_association_missing");
+      await recordHistoricalHermesApprovalEvent(f, "old-hermes-run");
+      await expect(recordHermesGatewayHistoricalTerminalProof({
+        db, companyId: f.companyId, issueId: f.issueId, agentId: f.agentId,
+        actorUserId: "board", queueId, queueRevision: "stale-revision",
+        paperclipRunId: f.sourceRunId, hermesRunId: "old-hermes-run",
+      })).rejects.toThrow("queued_comment_revision_conflict");
+      await recordHermesGatewayHistoricalTerminalProof({
+        db, companyId: f.companyId, issueId: f.issueId, agentId: f.agentId,
+        actorUserId: "board", queueId, queueRevision: await queueRevision(queueId, f.commentId),
+        paperclipRunId: f.sourceRunId, hermesRunId: "old-hermes-run",
+      });
+      const [proofAction] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+      expect(proofAction.evidence.hermesGatewayTerminalProof).toMatchObject({
+        schema: "paperclip.hermes-gateway-terminal-proof.v1",
+        paperclipRunId: f.sourceRunId,
+        hermesRunId: "old-hermes-run",
+        queueId,
+        association: "historical_approval_event",
+      });
       await Promise.all([
         heartbeat.resumeQueuedCommentInterrupt(f.companyId, queueId, { retryCleanup: true }),
         heartbeat.resumeQueuedCommentInterrupt(f.companyId, queueId, { retryCleanup: true }),

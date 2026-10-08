@@ -8,7 +8,7 @@ import { z } from "zod";
 import { and, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import {
   agents, agentWakeupRequests, approvals, issueApprovals, issueThreadInteractions,
-  environmentLeases, heartbeatRuns, issueComments, issueRecoveryActions,
+  environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions,
   issues, nativeRunFinalizations, nativeRunResults, type Db,
 } from "@paperclipai/db";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
@@ -18,7 +18,7 @@ import { persistActivity } from "./activity-log.js";
 import { secretService } from "./secrets.js";
 
 import { historicalAdapterType, isConversationAdapter } from "./conversation-continuation.js";
-import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
+import { queuedCommentIdsFromWakePayload, queuedCommentQueueRevision } from "./issue-queued-comment-queue.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
 const terminal = ["failed", "interrupted", "timed_out", "cancelled"];
@@ -98,6 +98,18 @@ type HermesGatewayBinding = {
   hermesRunId: string;
 };
 
+type HermesGatewayHistoricalTerminalProof = HermesGatewayBinding & {
+  schema: "paperclip.hermes-gateway-terminal-proof.v1";
+  paperclipRunId: string;
+  issueId: string;
+  agentId: string;
+  queueId: string;
+  recordedByUserId: string;
+  recordedAt: string;
+  proofStatus: string;
+  association: "historical_approval_event";
+};
+
 function hermesCredentialRefFromConfig(config: Record<string, unknown>): string | null {
   const apiKeyBinding = asRecord(config.apiKey);
   return readNonEmptyString(config.apiKeyRef)
@@ -130,6 +142,25 @@ function hermesGatewayBindingFromRun(run: Run): HermesGatewayBinding | null {
   return { apiBaseUrl, credentialRef, configVersion, hermesRunId };
 }
 
+function readHermesGatewayTerminalProofReceipt(value: unknown, run: Run, issueId: string, agentId: string): HermesGatewayBinding | null {
+  const receipt = asRecord(value);
+  if (!receipt || receipt.schema !== "paperclip.hermes-gateway-terminal-proof.v1") return null;
+  if (receipt.paperclipRunId !== run.id || receipt.issueId !== issueId || receipt.agentId !== agentId) return null;
+  const apiBaseUrl = normalizeHermesGatewayBaseUrl(receipt.apiBaseUrl);
+  const credentialRef = readNonEmptyString(receipt.credentialRef);
+  const hermesRunId = readNonEmptyString(receipt.hermesRunId);
+  const configVersion = readNonEmptyString(receipt.configVersion);
+  const recordedByUserId = readNonEmptyString(receipt.recordedByUserId);
+  const recordedAt = readNonEmptyString(receipt.recordedAt);
+  if (!apiBaseUrl || !credentialRef || !hermesRunId || !recordedByUserId || !recordedAt) return null;
+  return { apiBaseUrl, credentialRef, configVersion, hermesRunId };
+}
+
+function hermesGatewayBindingFromRunOrAction(run: Run, action: typeof issueRecoveryActions.$inferSelect, issueId: string, agentId: string): HermesGatewayBinding | null {
+  return hermesGatewayBindingFromRun(run)
+    ?? readHermesGatewayTerminalProofReceipt(asRecord(action.evidence)?.hermesGatewayTerminalProof, run, issueId, agentId);
+}
+
 function hermesGatewayTargetsMatch(expected: Omit<HermesGatewayBinding, "hermesRunId">, current: { apiBaseUrl: string; credentialRef: string; configVersion: string | null }): boolean {
   const sameCredential = expected.credentialRef === current.credentialRef
     || expected.credentialRef === "inline-api-key"
@@ -139,8 +170,8 @@ function hermesGatewayTargetsMatch(expected: Omit<HermesGatewayBinding, "hermesR
     && expected.configVersion === current.configVersion;
 }
 
-async function proveHistoricalHermesGatewayStopped(input: { db: Db; run: Run; agent: typeof agents.$inferSelect }): Promise<boolean> {
-  const binding = hermesGatewayBindingFromRun(input.run);
+async function proveHistoricalHermesGatewayStopped(input: { db: Db; run: Run; agent: typeof agents.$inferSelect; action: typeof issueRecoveryActions.$inferSelect; issueId: string }): Promise<boolean> {
+  const binding = hermesGatewayBindingFromRunOrAction(input.run, input.action, input.issueId, input.run.agentId);
   if (!binding) return false;
   const currentConfig = asRecord(input.agent.adapterConfig) ?? {};
   const currentTarget = hermesGatewayTargetFromConfig(currentConfig);
@@ -168,6 +199,95 @@ async function proveHistoricalHermesGatewayStopped(input: { db: Db; run: Run; ag
   });
   if (!proof || proof.runId !== binding.hermesRunId || !proof.terminal) return false;
   return ["completed", "failed", "error", "cancelled", "canceled", "stopped", "interrupted"].includes(proof.status);
+}
+
+/** Board-scoped reconciliation for pre-capture Hermes gateway rows.
+ * Records non-secret terminal proof metadata only; it does not resolve the hold
+ * or start work. Admission re-checks the remote terminal state using this receipt.
+ */
+export async function recordHermesGatewayHistoricalTerminalProof(input: {
+  db: Db; companyId: string; issueId: string; agentId: string; actorUserId: string;
+  queueId: string; queueRevision: string; paperclipRunId: string; hermesRunId: string;
+}): Promise<{ recoveryActionId: string; receipt: HermesGatewayHistoricalTerminalProof }> {
+  const { db, companyId, issueId, agentId, actorUserId, queueId, queueRevision, paperclipRunId, hermesRunId } = input;
+  return await db.transaction(async (tx) => {
+    const [issue] = await tx.select().from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId))).for("update");
+    if (!issue || issue.assigneeAgentId !== agentId || ["done", "cancelled"].includes(issue.status)) throw new Error("invalid_issue_scope");
+    const [agent] = await tx.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.id, agentId))).for("update");
+    if (!agent || agent.adapterType !== "hermes_gateway") throw new Error("invalid_agent_scope");
+    const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, paperclipRunId))).for("update");
+    if (!run || run.agentId !== agentId || (run.nativeIssueId ?? run.contextSnapshot?.issueId) !== issueId ||
+        run.runtimeMode !== "legacy" || run.status !== "cancelled" || run.errorCode !== "operator_interrupted" || !run.finishedAt) throw new Error("invalid_run_scope");
+    const historicalAdapter = await historicalAdapterType(tx as unknown as Db, run);
+    if (historicalAdapter !== "hermes_gateway") throw new Error("invalid_historical_adapter");
+    const [queue] = await tx.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.id, queueId),
+      eq(agentWakeupRequests.status, "deferred_issue_execution"), sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+      sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt'->>'actorId' = ${actorUserId}`,
+    )).for("update");
+    const queuedCommentIds = queue ? queuedCommentIdsFromWakePayload(queue.payload) : [];
+    if (!queue || !queuedCommentIds.length) throw new Error("queued_interrupt_required");
+    const queuedComments = await tx.select({ id: issueComments.id, updatedAt: issueComments.updatedAt, deletedAt: issueComments.deletedAt })
+      .from(issueComments).where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, queuedCommentIds)))
+      .for("update");
+    const commentsById = new Map(queuedComments.map(comment => [comment.id, comment]));
+    const liveQueuedComments = queuedCommentIds.flatMap(id => {
+      const comment = commentsById.get(id);
+      return comment && !comment.deletedAt ? [{ id: comment.id, updatedAt: comment.updatedAt }] : [];
+    });
+    if (liveQueuedComments.length !== queuedCommentIds.length || queuedCommentQueueRevision({ queueId, comments: liveQueuedComments }) !== queueRevision) {
+      throw new Error("queued_comment_revision_conflict");
+    }
+    const [action] = await tx.select().from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
+      eq(issueRecoveryActions.cause, "legacy_execution_requires_reconciliation"),
+      sql`${issueRecoveryActions.evidence}->>'runId' = ${paperclipRunId}`,
+      executionBlockerPredicate(),
+    )).for("update");
+    if (!action) throw new Error("recovery_action_not_found");
+    const currentConfig = asRecord(agent.adapterConfig) ?? {};
+    const currentTarget = hermesGatewayTargetFromConfig(currentConfig);
+    if (!currentTarget) throw new Error("hermes_gateway_binding_missing");
+    const [association] = await tx.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
+      eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRunEvents.runId, paperclipRunId),
+      eq(heartbeatRunEvents.eventType, "hermes_gateway.approval.requested"),
+      sql`${heartbeatRunEvents.payload}->>'schema' = 'paperclip.hermes_gateway.approval_request.v1'`,
+      sql`${heartbeatRunEvents.payload}->>'paperclipRunId' = ${paperclipRunId}`,
+      sql`${heartbeatRunEvents.payload}->>'companyId' = ${companyId}`,
+      sql`${heartbeatRunEvents.payload}->>'agentId' = ${agentId}`,
+      sql`${heartbeatRunEvents.payload}->>'hermesRunId' = ${hermesRunId}`,
+    )).limit(1);
+    if (!association) throw new Error("hermes_gateway_run_association_missing");
+    let apiKey = null as ReturnType<typeof readNonEmptyString>;
+    try {
+      const resolved = await secretService(tx).resolveAdapterConfigForRuntime(companyId, currentConfig,
+        { consumerType: "agent", consumerId: agentId }, { adapterType: "hermes_gateway", skipUserSecrets: true });
+      apiKey = readNonEmptyString(asRecord(resolved.config)?.apiKey);
+    } catch {
+      throw new Error("hermes_gateway_credential_unavailable");
+    }
+    if (!apiKey) throw new Error("hermes_gateway_credential_unavailable");
+    const proof = await readHermesGatewayRunTerminalState({ apiBaseUrl: currentTarget.apiBaseUrl, apiKey, hermesRunId, timeoutMs: 1500 });
+    if (!proof || proof.runId !== hermesRunId || !proof.terminal || !["completed", "failed", "error", "cancelled", "canceled", "stopped", "interrupted"].includes(proof.status)) {
+      throw new Error("hermes_gateway_terminal_proof_failed");
+    }
+    const receipt: HermesGatewayHistoricalTerminalProof = {
+      schema: "paperclip.hermes-gateway-terminal-proof.v1",
+      paperclipRunId, issueId, agentId, queueId, hermesRunId,
+      apiBaseUrl: currentTarget.apiBaseUrl, credentialRef: currentTarget.credentialRef,
+      configVersion: currentTarget.configVersion, recordedByUserId: actorUserId,
+      recordedAt: new Date().toISOString(), proofStatus: proof.status,
+      association: "historical_approval_event",
+    };
+    await tx.update(issueRecoveryActions).set({
+      evidence: { ...action.evidence, hermesGatewayTerminalProof: receipt },
+      updatedAt: new Date(),
+    }).where(eq(issueRecoveryActions.id, action.id));
+    await persistActivity(tx as unknown as Db, { companyId, actorType: "user", actorId: actorUserId,
+      action: "issue.hermes_gateway_terminal_proof_recorded", entityType: "issue", entityId: issueId,
+      details: { recoveryActionId: action.id, queueId, paperclipRunId, hermesRunId, proofStatus: proof.status } });
+    return { recoveryActionId: action.id, receipt };
+  });
 }
 
 /** Called under the issue lock, in the transaction that creates the new turn.
@@ -340,7 +460,7 @@ export async function admitExplicitNativeContinuation(input: {
         // strict PID/session proof for native and non-conversation adapters.
         const historicalAdapter = legacyUserTurn ? await historicalAdapterType(db, run) : null;
         if (legacyUserTurn && historicalAdapter === "hermes_gateway") {
-          if (!await proveHistoricalHermesGatewayStopped({ db, run, agent })) {
+          if (!await proveHistoricalHermesGatewayStopped({ db, run, agent, action, issueId })) {
             return blocked("remote_hermes_terminal_state_unknown", "The previous Hermes gateway run has no authenticated terminal-state proof. Paperclip cannot start this message yet.");
           }
         } else if (!legacyUserTurn && !run.processPid && !run.processGroupId &&
