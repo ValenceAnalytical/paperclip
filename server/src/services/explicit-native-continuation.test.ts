@@ -3,6 +3,7 @@ import { recordNativeLocalProcessStop, hasNativeLocalProcessStop, PROCESS_START_
 import { remoteTerminationReceipt } from "./remote-execution-termination.js";
 import { createHash, randomUUID } from "node:crypto";
 import { Buffer } from "node:buffer";
+import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -22,6 +23,9 @@ import { getExecutionBlocker } from "./execution-blocker.js";
 import { createDurableChatWakeupRequest } from "./durable-chat-wakeup.js";
 import { queuedCommentQueueRevision } from "./issue-queued-comment-queue.js";
 const support = await getEmbeddedPostgresTestSupport();
+const acc111LegacyApprovalShape = JSON.parse(readFileSync(new URL("./__fixtures__/acc111-legacy-hermes-approval-request-shape.json", import.meta.url), "utf8")) as {
+  events: Array<{ payloadWhitelisted: { schema: string; requestId: string; status: string } }>;
+};
 (support.supported ? describe : describe.skip)("explicit native conversation continuation", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
@@ -55,12 +59,37 @@ const support = await getEmbeddedPostgresTestSupport();
     return queuedCommentQueueRevision({ queueId, comments: [comment!] });
   }
 
-  async function recordHistoricalHermesApprovalEvent(f: Fixture, hermesRunId: string) {
+  async function recordHistoricalHermesApprovalEvent(f: Fixture, hermesRunId: string, payloadOverride: Partial<Record<string, unknown>> = {}) {
     await appendHeartbeatRunEvent(db, { companyId: f.companyId, runId: f.sourceRunId, agentId: f.agentId,
       eventType: "hermes_gateway.approval.requested", stream: "system", level: "warn", payload: {
         schema: "paperclip.hermes_gateway.approval_request.v1", paperclipRunId: f.sourceRunId,
         companyId: f.companyId, agentId: f.agentId, hermesRunId, requestId: randomUUID(), status: "pending",
+        ...payloadOverride,
       } });
+  }
+
+  async function insertHistoricalHermesApprovalEventRow(f: Fixture, hermesRunId: string, opts: { rowRunId?: string; rowAgentId?: string; payload?: Record<string, unknown> }) {
+    const rowRunId = opts.rowRunId ?? f.sourceRunId;
+    const [{ maxSeq }] = await db.select({ maxSeq: sql<number>`coalesce(max(${heartbeatRunEvents.seq}), 0)` }).from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, rowRunId));
+    const [row] = await db.insert(heartbeatRunEvents).values({
+      companyId: f.companyId,
+      runId: rowRunId,
+      agentId: opts.rowAgentId ?? f.agentId,
+      seq: Number(maxSeq) + 1,
+      eventType: "hermes_gateway.approval.requested",
+      stream: "system",
+      level: "warn",
+      payload: opts.payload ?? {
+        schema: "paperclip.hermes_gateway.approval_request.v1",
+        paperclipRunId: f.sourceRunId,
+        companyId: f.companyId,
+        agentId: f.agentId,
+        hermesRunId,
+        requestId: randomUUID(),
+        status: "pending",
+      },
+    }).returning({ id: heartbeatRunEvents.id });
+    return row.id;
   }
 
   async function withFakeHermesGateway<T>(handler: (input: { baseUrl: string; requests: Array<{ method: string; url: string; headers: Record<string, string>; body: unknown }> }) => Promise<T>, opts: { oldRunId?: string; oldStatus?: string } = {}): Promise<T> {
@@ -444,7 +473,41 @@ const support = await getEmbeddedPostgresTestSupport();
         actorUserId: "board", queueId, queueRevision: await queueRevision(queueId, f.commentId),
         paperclipRunId: f.sourceRunId, hermesRunId: "old-hermes-run",
       })).rejects.toThrow("hermes_gateway_run_association_missing");
-      await recordHistoricalHermesApprovalEvent(f, "old-hermes-run");
+      const [realAcc111Approval] = acc111LegacyApprovalShape.events;
+      expect(realAcc111Approval.payloadWhitelisted.schema).toBe("***REDACTED***");
+      const trustedPayload = {
+        schema: realAcc111Approval.payloadWhitelisted.schema,
+        paperclipRunId: f.sourceRunId,
+        companyId: f.companyId,
+        agentId: f.agentId,
+        hermesRunId: "old-hermes-run",
+        requestId: realAcc111Approval.payloadWhitelisted.requestId,
+        status: realAcc111Approval.payloadWhitelisted.status,
+      };
+      const wrongRunId = randomUUID();
+      const wrongRowAgentId = randomUUID();
+      await db.insert(agents).values({ id: wrongRowAgentId, companyId: f.companyId, name: "Wrong row", role: "engineer", adapterType: "paperclip_runner", status: "idle" });
+      await db.insert(heartbeatRuns).values({ id: wrongRunId, companyId: f.companyId, agentId: f.agentId, status: "cancelled", runtimeMode: "legacy", finishedAt: new Date() });
+      for (const bad of [
+        { name: "unknownschema", payload: { ...trustedPayload, schema: "paperclip.hermes_gateway.approval_request.v0" } },
+        { name: "missing", payload: Object.fromEntries(Object.entries(trustedPayload).filter(([key]) => key !== "schema")) },
+        { name: "payloadwrong", payload: { ...trustedPayload, paperclipRunId: randomUUID() } },
+        { name: "runidwrong", rowRunId: wrongRunId, payload: trustedPayload },
+        { name: "rowagentwrong", rowAgentId: wrongRowAgentId, payload: trustedPayload },
+      ]) {
+        const badEventId = await insertHistoricalHermesApprovalEventRow(f, "old-hermes-run", bad);
+        await expect(recordHermesGatewayHistoricalTerminalProof({
+          db, companyId: f.companyId, issueId: f.issueId, agentId: f.agentId,
+          actorUserId: "board", queueId, queueRevision: await queueRevision(queueId, f.commentId),
+          paperclipRunId: f.sourceRunId, hermesRunId: "old-hermes-run",
+        }), bad.name).rejects.toThrow("hermes_gateway_run_association_missing");
+        await db.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.id, badEventId));
+      }
+      await recordHistoricalHermesApprovalEvent(f, "old-hermes-run", {
+        schema: realAcc111Approval.payloadWhitelisted.schema,
+        requestId: realAcc111Approval.payloadWhitelisted.requestId,
+        status: realAcc111Approval.payloadWhitelisted.status,
+      });
       await expect(recordHermesGatewayHistoricalTerminalProof({
         db, companyId: f.companyId, issueId: f.issueId, agentId: f.agentId,
         actorUserId: "board", queueId, queueRevision: "stale-revision",

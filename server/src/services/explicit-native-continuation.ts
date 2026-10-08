@@ -250,8 +250,12 @@ export async function recordHermesGatewayHistoricalTerminalProof(input: {
     if (!currentTarget) throw new Error("hermes_gateway_binding_missing");
     const [association] = await tx.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
       eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRunEvents.runId, paperclipRunId),
+      eq(heartbeatRunEvents.agentId, agentId),
       eq(heartbeatRunEvents.eventType, "hermes_gateway.approval.requested"),
-      sql`${heartbeatRunEvents.payload}->>'schema' = 'paperclip.hermes_gateway.approval_request.v1'`,
+      // Older persisted Hermes approval events can have only the non-secret
+      // schema marker redacted. Keep the legacy sentinel narrow and continue
+      // binding the trusted row plus every run/company/agent/Hermes id below.
+      sql`${heartbeatRunEvents.payload}->>'schema' in ('paperclip.hermes_gateway.approval_request.v1', '***REDACTED***')`,
       sql`${heartbeatRunEvents.payload}->>'paperclipRunId' = ${paperclipRunId}`,
       sql`${heartbeatRunEvents.payload}->>'companyId' = ${companyId}`,
       sql`${heartbeatRunEvents.payload}->>'agentId' = ${agentId}`,
