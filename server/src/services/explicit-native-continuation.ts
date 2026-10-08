@@ -228,7 +228,10 @@ export async function admitExplicitNativeContinuation(input: {
       if (leases.some(lease => !lease.releasedAt || lease.cleanupStatus === "failed")) return blocked("local_cleanup", "Waiting for the previous environment to finish cleanup. Your message will start automatically.");
       if (!unusedAdmission && !cancelledStartup) {
         // A missing process identity is not evidence that a provider exited.
-        if (!run.processPid && !run.processGroupId &&
+        // Legacy conversation adapters, however, do not own a local native
+        // process to prove after a verified terminal conversation run. Keep
+        // strict PID/session proof for native and non-conversation adapters.
+        if (!legacyUserTurn && !run.processPid && !run.processGroupId &&
             !await hasNativeLocalProcessStop(db, companyId, run.id) &&
             !await hasHistoricalSuspendedNativeSession(db, run)) return blocked("process_identity_missing", "The previous run has no verified stop record. Paperclip cannot start this message yet.");
         if (run.processPid && !processStopped(run.processPid)) return blocked("process_running", "Waiting for the previous process to stop. Your message will start automatically.");

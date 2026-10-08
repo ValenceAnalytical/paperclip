@@ -2,9 +2,12 @@ import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { recordNativeLocalProcessStop, hasNativeLocalProcessStop, PROCESS_START_REQUESTED } from "./native-local-process-stop.js";
 import { remoteTerminationReceipt } from "./remote-execution-termination.js";
 import { createHash, randomUUID } from "node:crypto";
+import { Buffer } from "node:buffer";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHermesGatewayServerAdapter } from "@paperclipai/hermes-paperclip-adapter";
 import { and, eq } from "drizzle-orm";
 import { beforeAll, afterAll, describe, it, expect, vi } from "vitest";
 import {
@@ -46,6 +49,50 @@ const support = await getEmbeddedPostgresTestSupport();
       actorType: "user", actorId: "board", reason: "issue_commented" };
   }
   type Fixture = Awaited<ReturnType<typeof seed>>;
+
+  async function withFakeHermesGateway<T>(handler: (input: { baseUrl: string; requests: Array<{ method: string; url: string; headers: Record<string, string>; body: unknown }> }) => Promise<T>): Promise<T> {
+    const requests: Array<{ method: string; url: string; headers: Record<string, string>; body: unknown }> = [];
+    const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
+      req.on("end", () => {
+        const text = Buffer.concat(chunks).toString("utf8");
+        const body = text.trim() ? JSON.parse(text) : null;
+        requests.push({ method: req.method ?? "GET", url: req.url ?? "/", headers: req.headers as Record<string, string>, body });
+        if (req.method === "POST" && req.url === "/v1/runs") {
+          if (req.headers.authorization !== "Bearer test-hermes-key") {
+            res.writeHead(403, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: "forbidden" }));
+            return;
+          }
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ run_id: "hermes-run-fresh", status: "started" }));
+          return;
+        }
+        if (req.method === "GET" && req.url === "/v1/runs/hermes-run-fresh/events") {
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.end(`event: run.completed\ndata: ${JSON.stringify({ status: "completed", output: "resumed after queued comment" })}\n\n`);
+          return;
+        }
+        if (req.method === "GET" && req.url === "/v1/runs/hermes-run-fresh") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ status: "completed", output: "resumed after queued comment" }));
+          return;
+        }
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "not_found" }));
+      });
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    const baseUrl = `http://127.0.0.1:${typeof address === "object" && address ? address.port : 0}`;
+    try {
+      return await handler({ baseUrl, requests });
+    } finally {
+      await new Promise<void>((resolve, reject) => (server as Server).close((error?: Error) => error ? reject(error) : resolve()));
+    }
+  }
+
   it.each(["handoff", "foreign_task", "running_source", "different_owner", "mention", "interaction", "chat"])("adopts former-owner comments only during an authorized handoff (%s)", async kind => {
     const f = await seed(), nextAgentId = randomUUID(), queueId = randomUUID();
     await db.delete(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
@@ -319,6 +366,93 @@ const support = await getEmbeddedPostgresTestSupport();
       }, summary: null, exposeLowTrustRaw: false });
     if (kind === "valid" || kind === "stale_retry_context") await expect(result).resolves.toMatchObject({ interruptedRunId: f.sourceRunId });
     else await expect(result).rejects.toThrow("continuation_user_authorization_missing");
+  });
+
+  it("continues an operator-interrupted Hermes gateway legacy queue into exactly one authenticated remote run", async () => {
+    const f = await seed();
+    await db.update(agents).set({ adapterType: "hermes_gateway" }).where(eq(agents.id, f.agentId));
+    await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.sourceRunId));
+    await db.update(heartbeatRuns).set({
+      runtimeMode: "legacy",
+      status: "cancelled",
+      errorCode: "operator_interrupted",
+      nativeIssueId: null,
+      processPid: null,
+      processGroupId: null,
+      resultJson: { operatorInterrupted: true },
+      runnerProfileJson: { adapterDispatch: { adapterType: "hermes_gateway" } },
+    }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    await db.update(issueRecoveryActions).set({ cause: "legacy_execution_requires_reconciliation" })
+      .where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    await db.update(issueComments).set({ authorUserId: "operator", createdAt: new Date("2026-09-11T09:00:00Z") })
+      .where(eq(issueComments.id, f.commentId));
+    // Hold the Paperclip agent slot so admission proves the queued run without
+    // launching an uncontrolled adapter process from the heartbeat scheduler.
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+    const queueId = randomUUID();
+    await db.insert(agentWakeupRequests).values({ id: queueId, companyId: f.companyId, agentId: f.agentId,
+      source: "automation", reason: "issue_commented", status: "deferred_issue_execution",
+      requestedByActorType: "system", payload: { issueId: f.issueId, commentId: f.commentId,
+        _paperclipWakeContext: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentIds: [f.commentId] },
+        queuedCommentInterrupt: { actorId: "board", requestedAt: new Date().toISOString() } },
+    });
+
+    const heartbeat = heartbeatService(db);
+    await Promise.all([
+      heartbeat.resumeQueuedCommentInterrupt(f.companyId, queueId, { retryCleanup: true }),
+      heartbeat.resumeQueuedCommentInterrupt(f.companyId, queueId, { retryCleanup: true }),
+    ]);
+
+    const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, queueId));
+    expect(receipt.status).toBe("coalesced");
+    expect(receipt.payload?.queuedCommentInterrupt).toMatchObject({ actorId: "board" });
+    const runs = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.status, "queued")));
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({ agentId: f.agentId, runtimeMode: "legacy",
+      contextSnapshot: { wakeCommentIds: [f.commentId] } });
+    const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    expect(action.evidence.explicitUserContinuation).toMatchObject({
+      queuedCommentInterruptId: queueId,
+      previousRunId: f.sourceRunId,
+      runId: runs[0].id,
+    });
+    expect(action.evidence.automaticRecovery).toMatchObject({ replay: "explicit_user_continuation" });
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+
+    const envelope = await buildExecutionContinuation({ db, companyId: f.companyId, issueId: f.issueId,
+      agentId: f.agentId, runId: runs[0].id, context: runs[0].contextSnapshot!, summary: null, exposeLowTrustRaw: false });
+    expect(envelope.interruptedRunId).toBe(f.sourceRunId);
+    expect(envelope.originCommentIds).toEqual([f.commentId]);
+
+    await withFakeHermesGateway(async ({ baseUrl, requests }) => {
+      const adapter = createHermesGatewayServerAdapter();
+      const result = await adapter.execute({
+        runId: runs[0].id,
+        agent: { id: f.agentId, companyId: f.companyId, name: "Hermes", adapterType: "hermes_gateway",
+          adapterConfig: { apiBaseUrl: baseUrl, apiKey: "test-hermes-key", apiKeyRef: "secret-ref-hermes", paperclipApiUrl: "https://paperclip.example/api", sessionKeyStrategy: "issue", timeoutSec: 5 } },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: "ACC-111" },
+        config: { apiBaseUrl: baseUrl, apiKey: "test-hermes-key", apiKeyRef: "secret-ref-hermes", paperclipApiUrl: "https://paperclip.example/api", sessionKeyStrategy: "issue", timeoutSec: 5 },
+        context: {
+          issueId: f.issueId,
+          wakeReason: "issue_commented",
+          paperclipWake: { reason: "issue_commented", issue: { id: f.issueId, identifier: "ACC-111", title: "Resume" }, comments: envelope.messages },
+        },
+        authToken: "paperclip-run-token",
+        onLog: vi.fn(async () => undefined),
+        onMeta: vi.fn(async () => undefined),
+      });
+      expect(result).toMatchObject({ exitCode: 0, summary: "resumed after queued comment" });
+      const createCalls = requests.filter(request => request.method === "POST" && request.url === "/v1/runs");
+      expect(createCalls).toHaveLength(1);
+      expect(createCalls[0].headers.authorization).toBe("Bearer test-hermes-key");
+      expect(createCalls[0].headers["idempotency-key"]).toBe(runs[0].id);
+      expect(createCalls[0].headers["x-hermes-session-key"]).toBe(`paperclip:company:${f.companyId}:agent:${f.agentId}:issue:${f.issueId}`);
+      expect(createCalls[0].body).toMatchObject({
+        session_id: `paperclip:company:${f.companyId}:agent:${f.agentId}:issue:${f.issueId}`,
+        run_env: { PAPERCLIP_RUN_ID: runs[0].id, PAPERCLIP_COMPANY_ID: f.companyId, PAPERCLIP_AGENT_ID: f.agentId, PAPERCLIP_TASK_ID: f.issueId },
+      });
+      expect(JSON.stringify(createCalls[0].body)).not.toContain("test-hermes-key");
+    });
   });
 
   it.each(["valid", "wrong_actor", "consumed", "discarded", "operator_stop", "already_delivered", "earlier_delivered", "unstarted_cancelled", "unstarted_cancelled_metadata", "foreign_queue"])("validates automatic saved-message delivery: %s", async kind => {
