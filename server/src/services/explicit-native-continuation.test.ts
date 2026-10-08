@@ -50,7 +50,7 @@ const support = await getEmbeddedPostgresTestSupport();
   }
   type Fixture = Awaited<ReturnType<typeof seed>>;
 
-  async function withFakeHermesGateway<T>(handler: (input: { baseUrl: string; requests: Array<{ method: string; url: string; headers: Record<string, string>; body: unknown }> }) => Promise<T>): Promise<T> {
+  async function withFakeHermesGateway<T>(handler: (input: { baseUrl: string; requests: Array<{ method: string; url: string; headers: Record<string, string>; body: unknown }> }) => Promise<T>, opts: { oldRunId?: string; oldStatus?: string } = {}): Promise<T> {
     const requests: Array<{ method: string; url: string; headers: Record<string, string>; body: unknown }> = [];
     const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
       const chunks: Buffer[] = [];
@@ -59,6 +59,16 @@ const support = await getEmbeddedPostgresTestSupport();
         const text = Buffer.concat(chunks).toString("utf8");
         const body = text.trim() ? JSON.parse(text) : null;
         requests.push({ method: req.method ?? "GET", url: req.url ?? "/", headers: req.headers as Record<string, string>, body });
+        if (req.method === "GET" && opts.oldRunId && req.url === `/v1/runs/${opts.oldRunId}`) {
+          if (req.headers.authorization !== "Bearer test-hermes-key") {
+            res.writeHead(403, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: "forbidden" }));
+            return;
+          }
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ run_id: opts.oldRunId, status: opts.oldStatus ?? "completed", output: "old terminal proof" }));
+          return;
+        }
         if (req.method === "POST" && req.url === "/v1/runs") {
           if (req.headers.authorization !== "Bearer test-hermes-key") {
             res.writeHead(403, { "content-type": "application/json" });
@@ -370,7 +380,7 @@ const support = await getEmbeddedPostgresTestSupport();
 
   it("continues an operator-interrupted Hermes gateway legacy queue into exactly one authenticated remote run", async () => {
     const f = await seed();
-    await db.update(agents).set({ adapterType: "hermes_gateway" }).where(eq(agents.id, f.agentId));
+    await db.update(agents).set({ adapterType: "hermes_gateway", adapterConfig: { apiKey: "test-hermes-key" } }).where(eq(agents.id, f.agentId));
     await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.sourceRunId));
     await db.update(heartbeatRuns).set({
       runtimeMode: "legacy",
@@ -379,7 +389,7 @@ const support = await getEmbeddedPostgresTestSupport();
       nativeIssueId: null,
       processPid: null,
       processGroupId: null,
-      resultJson: { operatorInterrupted: true },
+      resultJson: { operatorInterrupted: true, run_id: "old-hermes-run" },
       runnerProfileJson: { adapterDispatch: { adapterType: "hermes_gateway" } },
     }).where(eq(heartbeatRuns.id, f.sourceRunId));
     await db.update(issueRecoveryActions).set({ cause: "legacy_execution_requires_reconciliation" })
@@ -397,34 +407,36 @@ const support = await getEmbeddedPostgresTestSupport();
         queuedCommentInterrupt: { actorId: "board", requestedAt: new Date().toISOString() } },
     });
 
-    const heartbeat = heartbeatService(db);
-    await Promise.all([
-      heartbeat.resumeQueuedCommentInterrupt(f.companyId, queueId, { retryCleanup: true }),
-      heartbeat.resumeQueuedCommentInterrupt(f.companyId, queueId, { retryCleanup: true }),
-    ]);
-
-    const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, queueId));
-    expect(receipt.status).toBe("coalesced");
-    expect(receipt.payload?.queuedCommentInterrupt).toMatchObject({ actorId: "board" });
-    const runs = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.status, "queued")));
-    expect(runs).toHaveLength(1);
-    expect(runs[0]).toMatchObject({ agentId: f.agentId, runtimeMode: "legacy",
-      contextSnapshot: { wakeCommentIds: [f.commentId] } });
-    const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
-    expect(action.evidence.explicitUserContinuation).toMatchObject({
-      queuedCommentInterruptId: queueId,
-      previousRunId: f.sourceRunId,
-      runId: runs[0].id,
-    });
-    expect(action.evidence.automaticRecovery).toMatchObject({ replay: "explicit_user_continuation" });
-    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
-
-    const envelope = await buildExecutionContinuation({ db, companyId: f.companyId, issueId: f.issueId,
-      agentId: f.agentId, runId: runs[0].id, context: runs[0].contextSnapshot!, summary: null, exposeLowTrustRaw: false });
-    expect(envelope.interruptedRunId).toBe(f.sourceRunId);
-    expect(envelope.originCommentIds).toEqual([f.commentId]);
-
     await withFakeHermesGateway(async ({ baseUrl, requests }) => {
+      await db.update(agents).set({ adapterConfig: { apiBaseUrl: baseUrl, apiKey: "test-hermes-key" } }).where(eq(agents.id, f.agentId));
+      await db.update(heartbeatRuns).set({ runnerProfileJson: { adapterDispatch: { adapterType: "hermes_gateway", hermesGateway: { apiBaseUrl: baseUrl, credentialRef: "inline-api-key", configVersion: null, hermesRunId: "old-hermes-run" } } } }).where(eq(heartbeatRuns.id, f.sourceRunId));
+      const heartbeat = heartbeatService(db);
+      await Promise.all([
+        heartbeat.resumeQueuedCommentInterrupt(f.companyId, queueId, { retryCleanup: true }),
+        heartbeat.resumeQueuedCommentInterrupt(f.companyId, queueId, { retryCleanup: true }),
+      ]);
+
+      const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, queueId));
+      expect(receipt.status).toBe("coalesced");
+      expect(receipt.payload?.queuedCommentInterrupt).toMatchObject({ actorId: "board" });
+      const runs = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.status, "queued")));
+      expect(runs).toHaveLength(1);
+      expect(runs[0]).toMatchObject({ agentId: f.agentId, runtimeMode: "legacy",
+        contextSnapshot: { wakeCommentIds: [f.commentId] } });
+      const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+      expect(action.evidence.explicitUserContinuation).toMatchObject({
+        queuedCommentInterruptId: queueId,
+        previousRunId: f.sourceRunId,
+        runId: runs[0].id,
+      });
+      expect(action.evidence.automaticRecovery).toMatchObject({ replay: "explicit_user_continuation" });
+      expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+
+      const envelope = await buildExecutionContinuation({ db, companyId: f.companyId, issueId: f.issueId,
+        agentId: f.agentId, runId: runs[0].id, context: runs[0].contextSnapshot!, summary: null, exposeLowTrustRaw: false });
+      expect(envelope.interruptedRunId).toBe(f.sourceRunId);
+      expect(envelope.originCommentIds).toEqual([f.commentId]);
+
       const adapter = createHermesGatewayServerAdapter();
       const result = await adapter.execute({
         runId: runs[0].id,
@@ -442,6 +454,9 @@ const support = await getEmbeddedPostgresTestSupport();
         onMeta: vi.fn(async () => undefined),
       });
       expect(result).toMatchObject({ exitCode: 0, summary: "resumed after queued comment" });
+      const oldStateReads = requests.filter(request => request.method === "GET" && request.url === "/v1/runs/old-hermes-run");
+      expect(oldStateReads.length).toBeGreaterThanOrEqual(1);
+      expect(oldStateReads.every(request => request.headers.authorization === "Bearer test-hermes-key")).toBe(true);
       const createCalls = requests.filter(request => request.method === "POST" && request.url === "/v1/runs");
       expect(createCalls).toHaveLength(1);
       expect(createCalls[0].headers.authorization).toBe("Bearer test-hermes-key");
@@ -452,7 +467,39 @@ const support = await getEmbeddedPostgresTestSupport();
         run_env: { PAPERCLIP_RUN_ID: runs[0].id, PAPERCLIP_COMPANY_ID: f.companyId, PAPERCLIP_AGENT_ID: f.agentId, PAPERCLIP_TASK_ID: f.issueId },
       });
       expect(JSON.stringify(createCalls[0].body)).not.toContain("test-hermes-key");
+    }, { oldRunId: "old-hermes-run", oldStatus: "completed" });
+  });
+
+  it("blocks a Paperclip-cancelled Hermes gateway queue while the authenticated old Hermes run is still running", async () => {
+    const f = await seed();
+    await db.update(agents).set({ adapterType: "hermes_gateway", adapterConfig: { apiKey: "test-hermes-key" } }).where(eq(agents.id, f.agentId));
+    await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.sourceRunId));
+    await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "cancelled", errorCode: "operator_interrupted",
+      nativeIssueId: null, processPid: null, processGroupId: null, resultJson: { run_id: "old-hermes-running" },
+    }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    await db.update(issueRecoveryActions).set({ cause: "legacy_execution_requires_reconciliation" })
+      .where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    await db.update(issueComments).set({ authorUserId: "operator", createdAt: new Date("2026-09-11T09:00:00Z") })
+      .where(eq(issueComments.id, f.commentId));
+    const queueId = randomUUID();
+    await db.insert(agentWakeupRequests).values({ id: queueId, companyId: f.companyId, agentId: f.agentId,
+      source: "automation", reason: "issue_commented", status: "deferred_issue_execution", requestedByActorType: "system",
+      payload: { issueId: f.issueId, commentId: f.commentId, _paperclipWakeContext: { issueId: f.issueId, wakeCommentIds: [f.commentId] },
+        queuedCommentInterrupt: { actorId: "board", requestedAt: new Date().toISOString() } },
     });
+    await withFakeHermesGateway(async ({ baseUrl, requests }) => {
+      await db.update(agents).set({ adapterConfig: { apiBaseUrl: baseUrl, apiKey: "test-hermes-key" } }).where(eq(agents.id, f.agentId));
+      await db.update(heartbeatRuns).set({ runnerProfileJson: { adapterDispatch: { adapterType: "hermes_gateway", hermesGateway: {
+        apiBaseUrl: baseUrl, credentialRef: "inline-api-key", configVersion: null, hermesRunId: "old-hermes-running",
+      } } } }).where(eq(heartbeatRuns.id, f.sourceRunId));
+      await heartbeatService(db).resumeQueuedCommentInterrupt(f.companyId, queueId, { retryCleanup: true });
+      const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, queueId));
+      expect(receipt.status).toBe("deferred_issue_execution");
+      expect(await getExecutionBlocker(db, f.companyId, f.issueId)).not.toBeNull();
+      expect(requests.filter(request => request.method === "GET" && request.url === "/v1/runs/old-hermes-running")).toHaveLength(1);
+      expect(requests.filter(request => request.method === "POST" && request.url === "/v1/runs")).toHaveLength(0);
+      expect(requests.filter(request => request.method === "POST" && request.url?.includes("/approval"))).toHaveLength(0);
+    }, { oldRunId: "old-hermes-running", oldStatus: "running" });
   });
 
   it.each(["valid", "wrong_actor", "consumed", "discarded", "operator_stop", "already_delivered", "earlier_delivered", "unstarted_cancelled", "unstarted_cancelled_metadata", "foreign_queue"])("validates automatic saved-message delivery: %s", async kind => {

@@ -2,6 +2,7 @@ import { readQueuedInteractionResponse } from "./queued-interaction-response.js"
 import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
 import { hasNativeLocalProcessStop, hasHistoricalSuspendedNativeSession } from "./native-local-process-stop.js";
 import { completeTerminatedRemoteNativeSessionCleanup } from "../vendor/paperclip-runner/index.js";
+import { readHermesGatewayRunTerminalState } from "@paperclipai/hermes-paperclip-adapter/gateway/server";
 import { hasRemoteTerminationReceipt, remoteLeaseCleanupScope } from "./remote-execution-termination.js";
 import { z } from "zod";
 import { and, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
@@ -14,6 +15,7 @@ import { executionBlockerPredicate, getExecutionBlocker } from "./execution-bloc
 import { buildExecutionContinuation } from "./execution-continuation.js";
 import { adapterExecutionControls } from "./adapter-execution-control.js";
 import { persistActivity } from "./activity-log.js";
+import { secretService } from "./secrets.js";
 
 import { historicalAdapterType, isConversationAdapter } from "./conversation-continuation.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
@@ -61,6 +63,111 @@ export async function undeliveredLegacyUserCommentIds(
     }
   }
   return commentIds.filter(id => valid.has(id));
+}
+
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function readNonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function normalizeHermesGatewayBaseUrl(value: unknown): string | null {
+  const raw = readNonEmptyString(value);
+  if (!raw) return null;
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    const normalizedPath = url.pathname.replace(/\/+$/, "") || "/";
+    if (url.port === "9119" && ["", "/", "/chat"].includes(normalizedPath)) url.pathname = "/api";
+    else url.pathname = url.pathname.replace(/\/+$/, "");
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return null;
+  }
+}
+
+type HermesGatewayBinding = {
+  apiBaseUrl: string;
+  credentialRef: string;
+  configVersion: string | null;
+  hermesRunId: string;
+};
+
+function hermesCredentialRefFromConfig(config: Record<string, unknown>): string | null {
+  const apiKeyBinding = asRecord(config.apiKey);
+  return readNonEmptyString(config.apiKeyRef)
+    ?? readNonEmptyString(config.apiKeyId)
+    ?? readNonEmptyString(config.credentialId)
+    ?? readNonEmptyString(apiKeyBinding?.secretId)
+    ?? (readNonEmptyString(config.apiKey) ? "inline-api-key" : null);
+}
+
+function hermesGatewayTargetFromConfig(config: Record<string, unknown>) {
+  const apiBaseUrl = normalizeHermesGatewayBaseUrl(config.apiBaseUrl ?? config.url);
+  const credentialRef = hermesCredentialRefFromConfig(config);
+  if (!apiBaseUrl || !credentialRef) return null;
+  return { apiBaseUrl, credentialRef, configVersion: readNonEmptyString(config.configVersion) ?? readNonEmptyString(config.version) };
+}
+
+function hermesGatewayBindingFromRun(run: Run): HermesGatewayBinding | null {
+  const profile = asRecord(run.runnerProfileJson);
+  const dispatch = asRecord(profile?.adapterDispatch);
+  const gateway = asRecord(dispatch?.hermesGateway) ?? asRecord(dispatch?.gateway);
+  const result = asRecord(run.resultJson);
+  const apiBaseUrl = normalizeHermesGatewayBaseUrl(gateway?.apiBaseUrl);
+  const credentialRef = readNonEmptyString(gateway?.credentialRef);
+  const configVersion = readNonEmptyString(gateway?.configVersion);
+  const hermesRunId = readNonEmptyString(gateway?.hermesRunId)
+    ?? readNonEmptyString(run.externalRunId)
+    ?? readNonEmptyString(result?.run_id)
+    ?? readNonEmptyString(result?.runId);
+  if (!apiBaseUrl || !credentialRef || !hermesRunId) return null;
+  return { apiBaseUrl, credentialRef, configVersion, hermesRunId };
+}
+
+function hermesGatewayTargetsMatch(expected: Omit<HermesGatewayBinding, "hermesRunId">, current: { apiBaseUrl: string; credentialRef: string; configVersion: string | null }): boolean {
+  const sameCredential = expected.credentialRef === current.credentialRef
+    || expected.credentialRef === "inline-api-key"
+    || current.credentialRef === "inline-api-key";
+  return expected.apiBaseUrl === current.apiBaseUrl
+    && sameCredential
+    && expected.configVersion === current.configVersion;
+}
+
+async function proveHistoricalHermesGatewayStopped(input: { db: Db; run: Run; agent: typeof agents.$inferSelect }): Promise<boolean> {
+  const binding = hermesGatewayBindingFromRun(input.run);
+  if (!binding) return false;
+  const currentConfig = asRecord(input.agent.adapterConfig) ?? {};
+  const currentTarget = hermesGatewayTargetFromConfig(currentConfig);
+  if (!currentTarget || !hermesGatewayTargetsMatch(binding, currentTarget)) return false;
+  let apiKey: string | null = null;
+  if (readNonEmptyString(currentConfig.apiKey) && (binding.credentialRef === "inline-api-key" || currentTarget.credentialRef === "inline-api-key")) {
+    apiKey = readNonEmptyString(currentConfig.apiKey);
+  } else {
+    try {
+      const resolved = await secretService(input.db).resolveAdapterConfigForRuntime(
+        input.run.companyId,
+        currentConfig,
+        { consumerType: "agent", consumerId: input.run.agentId },
+        { adapterType: "hermes_gateway", skipUserSecrets: true },
+      );
+      const resolvedConfig = asRecord(resolved.config) ?? {};
+      apiKey = readNonEmptyString(resolvedConfig.apiKey);
+    } catch {
+      return false;
+    }
+  }
+  if (!apiKey) return false;
+  const proof = await readHermesGatewayRunTerminalState({
+    apiBaseUrl: binding.apiBaseUrl, apiKey, hermesRunId: binding.hermesRunId, timeoutMs: 1500,
+  });
+  if (!proof || proof.runId !== binding.hermesRunId || !proof.terminal) return false;
+  return ["completed", "failed", "error", "cancelled", "canceled", "stopped", "interrupted"].includes(proof.status);
 }
 
 /** Called under the issue lock, in the transaction that creates the new turn.
@@ -231,7 +338,12 @@ export async function admitExplicitNativeContinuation(input: {
         // Legacy conversation adapters, however, do not own a local native
         // process to prove after a verified terminal conversation run. Keep
         // strict PID/session proof for native and non-conversation adapters.
-        if (!legacyUserTurn && !run.processPid && !run.processGroupId &&
+        const historicalAdapter = legacyUserTurn ? await historicalAdapterType(db, run) : null;
+        if (legacyUserTurn && historicalAdapter === "hermes_gateway") {
+          if (!await proveHistoricalHermesGatewayStopped({ db, run, agent })) {
+            return blocked("remote_hermes_terminal_state_unknown", "The previous Hermes gateway run has no authenticated terminal-state proof. Paperclip cannot start this message yet.");
+          }
+        } else if (!legacyUserTurn && !run.processPid && !run.processGroupId &&
             !await hasNativeLocalProcessStop(db, companyId, run.id) &&
             !await hasHistoricalSuspendedNativeSession(db, run)) return blocked("process_identity_missing", "The previous run has no verified stop record. Paperclip cannot start this message yet.");
         if (run.processPid && !processStopped(run.processPid)) return blocked("process_running", "Waiting for the previous process to stop. Your message will start automatically.");

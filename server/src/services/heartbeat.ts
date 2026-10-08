@@ -4395,6 +4395,45 @@ function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
+
+function normalizeHermesGatewayDispatchBaseUrl(value: unknown): string | null {
+  const raw = readNonEmptyString(value);
+  if (!raw) return null;
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    const normalizedPath = url.pathname.replace(/\/+$/, "") || "/";
+    if (url.port === "9119" && ["", "/", "/chat"].includes(normalizedPath)) url.pathname = "/api";
+    else url.pathname = url.pathname.replace(/\/+$/, "");
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return null;
+  }
+}
+
+function buildAdapterDispatchMetadata(agent: { adapterType: string; adapterConfig?: unknown }): Record<string, unknown> {
+  const dispatch: Record<string, unknown> = { adapterType: agent.adapterType };
+  if (agent.adapterType !== "hermes_gateway") return dispatch;
+  const config = parseObject(agent.adapterConfig);
+  const apiBaseUrl = normalizeHermesGatewayDispatchBaseUrl(config.apiBaseUrl ?? config.url);
+  const apiKeyBinding = parseObject(config.apiKey);
+  const credentialRef = readNonEmptyString(config.apiKeyRef)
+    ?? readNonEmptyString(config.apiKeyId)
+    ?? readNonEmptyString(config.credentialId)
+    ?? readNonEmptyString(apiKeyBinding.secretId)
+    ?? (readNonEmptyString(config.apiKey) ? "inline-api-key" : null);
+  if (apiBaseUrl && credentialRef) {
+    dispatch.hermesGateway = {
+      apiBaseUrl,
+      credentialRef,
+      configVersion: readNonEmptyString(config.configVersion) ?? readNonEmptyString(config.version),
+    };
+  }
+  return dispatch;
+}
+
 function parseNativeSessionGoalControl(
   value: unknown,
 ): NativeSessionGoalControl | null {
@@ -17456,7 +17495,7 @@ export function heartbeatService(
                   .update(heartbeatRuns)
                   .set({
                     status: "running",
-                    runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType } })}::jsonb`,
+                    runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: buildAdapterDispatchMetadata(agent) })}::jsonb`,
                     ...legacyControllerClaim(run.runtimeMode),
                     responsibleUserId,
                     startedAt: lockedRun.startedAt ?? claimedAt,
@@ -17554,7 +17593,7 @@ export function heartbeatService(
                 .update(heartbeatRuns)
                 .set({
                   status: "running",
-                  runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType } })}::jsonb`,
+                  runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: buildAdapterDispatchMetadata(agent) })}::jsonb`,
                     ...legacyControllerClaim(run.runtimeMode),
                   responsibleUserId,
                   startedAt: lockedRun.startedAt ?? claimedAt,
@@ -17620,7 +17659,7 @@ export function heartbeatService(
       : await withChatControlRecoveryGate(run, "claim", async (tx) => {
           const claimValues = {
             status: "running",
-            runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType } })}::jsonb`,
+            runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: buildAdapterDispatchMetadata(agent) })}::jsonb`,
             ...legacyControllerClaim(run.runtimeMode),
             responsibleUserId,
             startedAt: run.startedAt ?? claimedAt,
@@ -22896,6 +22935,11 @@ export function heartbeatService(
             message: "adapter invocation",
             payload: meta as unknown as Record<string, unknown>,
           });
+          const hermesRunId = readNonEmptyString(parseObject(meta.context).hermesRunId);
+          if (agent.adapterType === "hermes_gateway" && hermesRunId) {
+            await db.update(heartbeatRuns).set({ externalRunId: hermesRunId, updatedAt: new Date() })
+              .where(and(eq(heartbeatRuns.id, currentRun.id), eq(heartbeatRuns.companyId, currentRun.companyId), isNull(heartbeatRuns.externalRunId)));
+          }
         };
 
         const onAdapterEvent = async (event: AdapterRuntimeEvent) => {

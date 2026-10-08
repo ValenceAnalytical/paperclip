@@ -359,6 +359,51 @@ function buildInput(ctx: AdapterExecutionContext, paperclipApiUrl: string | null
   return lines.filter((line) => line !== null && line !== undefined).join("\n").trim();
 }
 
+
+export type HermesGatewayRunTerminalProof = {
+  runId: string;
+  status: string;
+  terminal: boolean;
+  payload: Record<string, unknown> | null;
+};
+
+export async function readHermesGatewayRunTerminalState(input: {
+  apiBaseUrl: string;
+  apiKey: string;
+  hermesRunId: string;
+  timeoutMs?: number;
+}): Promise<HermesGatewayRunTerminalProof | null> {
+  const baseUrl = normalizeBaseUrl(input.apiBaseUrl);
+  const apiKey = nonEmpty(input.apiKey);
+  const hermesRunId = nonEmpty(input.hermesRunId);
+  if (!baseUrl || !apiKey || !hermesRunId) return null;
+  if (isRemotePlainHttp(baseUrl) && !allowsInsecureRemoteHttp({})) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error("Hermes terminal-state proof timed out")), Math.max(250, input.timeoutMs ?? 1500));
+  try {
+    const status = await fetchJson(apiUrl(baseUrl, `/v1/runs/${encodeURIComponent(hermesRunId)}`), {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        Accept: "application/json",
+      },
+      signal: controller.signal,
+    });
+    const normalized = extractStatus(status);
+    if (!normalized) return null;
+    return {
+      runId: hermesRunId,
+      status: normalized,
+      terminal: TERMINAL_STATUSES.has(normalized),
+      payload: asRecord(status),
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function approvalDispatchTargetFromConfig(config: Record<string, unknown>): HermesApprovalDispatchTarget | null {
   const rawBaseUrl = nonEmpty(config.apiBaseUrl) ?? nonEmpty(config.url);
   if (!rawBaseUrl) return null;
@@ -1127,6 +1172,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   await ctx.onLog("stdout", `[hermes-gateway] run created: ${runId}\n`);
+  await ctx.onMeta?.({
+    adapterType: ADAPTER_TYPE,
+    command: "GET /v1/runs/{run_id}",
+    commandArgs: [apiUrl(baseUrl, `/v1/runs/${encodeURIComponent(runId)}`)],
+    context: { runId: ctx.runId, hermesRunId: runId },
+  });
 
   const state = createExecutionState(runId);
   const controller = new AbortController();
