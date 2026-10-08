@@ -108,6 +108,104 @@ export function collectHermesApprovalRequests(
   });
 }
 
+function statusLabel(request: HermesApprovalRequestCard): string {
+  return request.status + (request.choice ? ` (${request.choice})` : "");
+}
+
+function ApprovalRequestCard({
+  request,
+  mutation,
+}: {
+  request: HermesApprovalRequestCard;
+  mutation: ReturnType<typeof useMutation<unknown, Error, { runId: string; requestId: string; choice: "once" | "deny" }>>;
+}) {
+  const payload = request.payload;
+  const description = nonEmptyString(payload.description) ?? "Hermes is waiting for operator approval.";
+  const preview = nonEmptyString(payload.command) ?? nonEmptyString(payload.code);
+  const reason = nonEmptyString(payload.reason);
+  const cwd = nonEmptyString(payload.cwd);
+  const displayDigest = nonEmptyString(payload.displayDigest);
+  const expiresAt = nonEmptyString(payload.expiresAt);
+  const pendingThis = mutation.isPending &&
+    mutation.variables?.runId === request.runId &&
+    mutation.variables?.requestId === request.requestId;
+
+  return (
+    <div className="rounded-2xl border border-amber-300/70 bg-amber-50/80 p-3 text-sm text-amber-950 dark:border-amber-500/40 dark:bg-amber-950/20 dark:text-amber-100">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div className="min-w-0 space-y-1">
+          <div className="text-xs font-semibold uppercase tracking-wide text-amber-700 dark:text-amber-300">Hermes approval required</div>
+          <div>{description}</div>
+          {reason && <div className="text-xs text-amber-800/80 dark:text-amber-200/80">Reason: {reason}</div>}
+          {cwd && <div className="text-xs text-amber-800/80 dark:text-amber-200/80">cwd: {cwd}</div>}
+          {preview && (
+            <pre className="mt-2 max-h-32 overflow-auto rounded-lg bg-background/70 p-2 text-xs text-foreground whitespace-pre-wrap">
+              {preview}
+            </pre>
+          )}
+          <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-amber-800/75 dark:text-amber-200/75">
+            <span>Run {request.runId}</span>
+            <span>Request {request.requestId}</span>
+            <span>Status {statusLabel(request)}</span>
+            {displayDigest && <span>Digest {displayDigest}</span>}
+            {expiresAt && <span>Expires {relativeTime(expiresAt)}</span>}
+          </div>
+          <div className="text-xs text-amber-800/70 dark:text-amber-200/70">
+            Approve once authorizes only this exact Hermes run/request. The digest is Paperclip display integrity, not a Hermes-enforced command hash.
+          </div>
+        </div>
+        <div className="flex shrink-0 gap-2">
+          <Button type="button" size="xs" variant="default" disabled={pendingThis} onClick={() => mutation.mutate({ runId: request.runId, requestId: request.requestId, choice: "once" })}>
+            Approve once
+          </Button>
+          <Button type="button" size="xs" variant="outline" disabled={pendingThis} onClick={() => mutation.mutate({ runId: request.runId, requestId: request.requestId, choice: "deny" })}>
+            Deny
+          </Button>
+        </div>
+      </div>
+      {mutation.isError && mutation.variables?.runId === request.runId && mutation.variables?.requestId === request.requestId && (
+        <div className="mt-2 text-xs text-red-700 dark:text-red-300">
+          {mutation.error instanceof Error ? mutation.error.message : "Failed to resolve approval"}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ApprovalHistoryRow({ request }: { request: HermesApprovalRequestCard }) {
+  const payload = request.payload;
+  const description = nonEmptyString(payload.description) ?? "Hermes approval request";
+  const preview = nonEmptyString(payload.command) ?? nonEmptyString(payload.code);
+  const displayDigest = nonEmptyString(payload.displayDigest);
+  const expiresAt = nonEmptyString(payload.expiresAt);
+  const requestedAt = nonEmptyString(payload.requestedAt);
+
+  return (
+    <details className="rounded-lg border border-border/70 bg-background/70 px-2 py-1.5 text-xs text-muted-foreground">
+      <summary className="cursor-pointer">
+        <span className="font-medium text-foreground">{statusLabel(request)}</span>
+        <span className="mx-1">·</span>
+        <span>{description}</span>
+        <span className="mx-1">·</span>
+        <span>Run {request.runId}</span>
+      </summary>
+      <div className="mt-2 space-y-1 pl-3">
+        <div className="flex flex-wrap gap-x-3 gap-y-1">
+          <span>Request {request.requestId}</span>
+          {requestedAt && <span>Requested {relativeTime(requestedAt)}</span>}
+          {expiresAt && <span>Expires {relativeTime(expiresAt)}</span>}
+          {displayDigest && <span>Digest {displayDigest}</span>}
+        </div>
+        {preview && (
+          <pre className="max-h-28 overflow-auto rounded-md bg-muted/60 p-2 text-[11px] text-foreground whitespace-pre-wrap">
+            {preview}
+          </pre>
+        )}
+      </div>
+    </details>
+  );
+}
+
 export function HermesApprovalCards({
   runEvents,
   className,
@@ -126,9 +224,8 @@ export function HermesApprovalCards({
     () => collectHermesApprovalRequests(runEvents, nowMs),
     [runEvents, nowMs],
   );
-  const mutation = useMutation({
-    mutationFn: (input: { runId: string; requestId: string; choice: "once" | "deny" }) =>
-      heartbeatsApi.resolveHermesApproval(input),
+  const mutation = useMutation<unknown, Error, { runId: string; requestId: string; choice: "once" | "deny" }>({
+    mutationFn: (input) => heartbeatsApi.resolveHermesApproval(input),
     onSuccess: async (_result, variables) => {
       if (variables) await onResolved?.(variables.runId);
     },
@@ -136,63 +233,33 @@ export function HermesApprovalCards({
 
   if (approvalRequests.length === 0) return null;
 
+  const pendingRequests = approvalRequests.filter((request) => request.status === "pending");
+  const historicalRequests = approvalRequests.filter((request) => request.status !== "pending");
+
   return (
     <div className={className ?? "space-y-2"} data-testid="hermes-approval-cards">
-      {approvalRequests.map((request) => {
-        const payload = request.payload;
-        const description = nonEmptyString(payload.description) ?? "Hermes is waiting for operator approval.";
-        const preview = nonEmptyString(payload.command) ?? nonEmptyString(payload.code);
-        const reason = nonEmptyString(payload.reason);
-        const cwd = nonEmptyString(payload.cwd);
-        const displayDigest = nonEmptyString(payload.displayDigest);
-        const expiresAt = nonEmptyString(payload.expiresAt);
-        const pendingThis = mutation.isPending &&
-          mutation.variables?.runId === request.runId &&
-          mutation.variables?.requestId === request.requestId;
-        const canResolve = request.status === "pending";
-        return (
-          <div key={`${request.runId}:${request.eventId}:${request.requestId}`} className="rounded-2xl border border-amber-300/70 bg-amber-50/80 p-3 text-sm text-amber-950 dark:border-amber-500/40 dark:bg-amber-950/20 dark:text-amber-100">
-            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-              <div className="min-w-0 space-y-1">
-                <div className="text-xs font-semibold uppercase tracking-wide text-amber-700 dark:text-amber-300">Hermes approval required</div>
-                <div>{description}</div>
-                {reason && <div className="text-xs text-amber-800/80 dark:text-amber-200/80">Reason: {reason}</div>}
-                {cwd && <div className="text-xs text-amber-800/80 dark:text-amber-200/80">cwd: {cwd}</div>}
-                {preview && (
-                  <pre className="mt-2 max-h-32 overflow-auto rounded-lg bg-background/70 p-2 text-xs text-foreground whitespace-pre-wrap">
-                    {preview}
-                  </pre>
-                )}
-                <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-amber-800/75 dark:text-amber-200/75">
-                  <span>Run {request.runId}</span>
-                  <span>Request {request.requestId}</span>
-                  <span>Status {request.status}{request.choice ? ` (${request.choice})` : ""}</span>
-                  {displayDigest && <span>Digest {displayDigest}</span>}
-                  {expiresAt && <span>Expires {relativeTime(expiresAt)}</span>}
-                </div>
-                <div className="text-xs text-amber-800/70 dark:text-amber-200/70">
-                  Approve once authorizes only this exact Hermes run/request. The digest is Paperclip display integrity, not a Hermes-enforced command hash.
-                </div>
-              </div>
-              {canResolve && (
-                <div className="flex shrink-0 gap-2">
-                  <Button type="button" size="xs" variant="default" disabled={pendingThis} onClick={() => mutation.mutate({ runId: request.runId, requestId: request.requestId, choice: "once" })}>
-                    Approve once
-                  </Button>
-                  <Button type="button" size="xs" variant="outline" disabled={pendingThis} onClick={() => mutation.mutate({ runId: request.runId, requestId: request.requestId, choice: "deny" })}>
-                    Deny
-                  </Button>
-                </div>
-              )}
-            </div>
-            {mutation.isError && mutation.variables?.runId === request.runId && mutation.variables?.requestId === request.requestId && (
-              <div className="mt-2 text-xs text-red-700 dark:text-red-300">
-                {mutation.error instanceof Error ? mutation.error.message : "Failed to resolve approval"}
-              </div>
-            )}
+      {pendingRequests.map((request) => (
+        <ApprovalRequestCard
+          key={`${request.runId}:${request.eventId}:${request.requestId}`}
+          request={request}
+          mutation={mutation}
+        />
+      ))}
+      {historicalRequests.length > 0 ? (
+        <details className="rounded-xl border border-border/70 bg-muted/30 p-2 text-sm" data-testid="hermes-approval-history">
+          <summary className="cursor-pointer text-xs font-medium uppercase tracking-wide text-muted-foreground">
+            Hermes approval history ({historicalRequests.length})
+          </summary>
+          <div className="mt-2 space-y-1.5">
+            {historicalRequests.map((request) => (
+              <ApprovalHistoryRow
+                key={`${request.runId}:${request.eventId}:${request.requestId}`}
+                request={request}
+              />
+            ))}
           </div>
-        );
-      })}
+        </details>
+      ) : null}
     </div>
   );
 }
