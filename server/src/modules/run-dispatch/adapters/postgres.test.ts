@@ -825,7 +825,12 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     await expect(adapter.cancelStaleQueuedRun({ companyId, runId, expectedStatus: "queued", now: new Date() })).resolves.toMatchObject({ outcome: "cancelled", errorCode: "execution_reconciliation_required" });
   });
 
-  it.each(["active", "resolved"])("allows a new message through a historical %s interruption hold", async status => {
+  it.each([
+    ["active", "codex_local"],
+    ["resolved", "codex_local"],
+    ["active", "hermes_gateway"],
+    ["resolved", "hermes_gateway"],
+  ] as const)("allows a new message through a historical %s %s interruption hold", async (status, historicalAdapterType) => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     await db.update(agents).set({ adapterType: "process" }).where(eq(agents.id, agentId));
     const issueId = randomUUID(), previousRunId = randomUUID(), runId = randomUUID();
@@ -835,7 +840,7 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       { id: runId, companyId, agentId, status: "queued", contextSnapshot: { issueId, wakeReason: "issue_commented" } },
     ]);
     await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: previousRunId,
-      seq: 1, eventType: "adapter.invoke", payload: { adapterType: "codex_local" } });
+      seq: 1, eventType: "adapter.invoke", payload: { adapterType: historicalAdapterType } });
     const [action] = await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issueId,
       kind: "active_run_watchdog", ownerType: "board", cause: "legacy_execution_requires_reconciliation", status,
       evidence: { runId: previousRunId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } },
